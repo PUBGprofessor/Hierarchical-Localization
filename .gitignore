@@ -9,4 +9,4 @@ datasets/*
 !datasets/sacre_coeur/
 datasets/sacre_coeur/query
 third_party
-.ipynb
+*.ipynb
