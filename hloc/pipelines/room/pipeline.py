@@ -15,9 +15,9 @@ from ... import (
 
 def run(args):
     # Setup the paths
-    dataset = args.dataset  # 这里是dataset/aachen_v1.1
+    dataset = args.dataset  # 这里是dataset/room_raw63_render62
     images = dataset / "images/"  # dataset/room_raw63/images/
-    sift_sfm = dataset / "3D-models/room_raw63"  # dataset/aachen_v1.1/3D-models/room_raw63，官方提供的 COLMAP SfM 模型
+    sift_sfm = dataset / "3D-models/room_raw63_render62"  # dataset/aachen_v1.1/3D-models/room_raw63，官方提供的 COLMAP SfM 模型
 
     outputs = args.outputs  # the path where everything will be saved, 这里是outputs/room_raw63
     reference_sfm = outputs / "sfm_superpoint+lightglue"  # the SfM model we will rebuild, 我们们将基于 SuperPoint+SuperGlue 重建的 SfM 模型
@@ -29,7 +29,7 @@ def run(args):
     )  # top-k retrieved by NetVLAD
 
     results = (
-        outputs / f"room_raw63_hloc_superpoint+superglue_netvlad{args.num_loc}.txt"
+        outputs / f"room_raw63_render62_hloc_superpoint+superglue_netvlad{args.num_loc}.txt"
     )
 
     # list the standard configurations available
@@ -72,8 +72,8 @@ def run(args):
 #     （一般使用superpoint）提取局部特征（SuperPoint）。
 #     所有图片（包括数据库 Database 图片和查询 Query 图片）。
 #     返回生成的.h5 文件的路径，存着几千张图的 Keypoints 和 Descriptors。
-    # features = extract_features.main(feature_conf, images, outputs)  # 即写入的feats-superpoint-n2048-rmax1024.h5
-    features = outputs / "feats-superpoint-n2048-rmax1024.h5"
+    features = extract_features.main(feature_conf, images, outputs)  # 即写入的feats-superpoint-n2048-rmax1024.h5
+    # features = outputs / "feats-superpoint-n2048-rmax1024.h5"
 
 #   它读取旧的 sift_sfm 模型（官方提供的 COLMAP 模型）。如果旧模型里两张图看到了足够多的同一个 3D 点（即由共视关系 Covisibility），我们就认为这两张图应该匹配。
 #   两两匹配（$N^2$）太慢了，只匹配“邻居”，极大加速。
@@ -125,13 +125,13 @@ if __name__ == "__main__":
         "--dataset",
         type=Path,
         # default="datasets/aachen_v1.1",
-        default="datasets/room_raw63",
+        default="datasets/room_raw63_render62",
         help="Path to the dataset, default: %(default)s",
     )
     parser.add_argument(
         "--outputs",
         type=Path,
-        default="outputs/room_raw63",
+        default="outputs/room_raw63_render62",
         help="Path to the output directory, default: %(default)s",
     )
     parser.add_argument( # 建图阶段的“寻亲”数量
