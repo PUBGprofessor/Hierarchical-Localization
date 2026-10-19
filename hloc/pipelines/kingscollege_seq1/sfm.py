@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import argparse
 from pathlib import Path
 from ... import (
@@ -70,4 +71,3 @@ if __name__ == "__main__":
         help="每一帧图片向后匹配的邻居数量（建议 5-15）"
     )
     args = parser.parse_args()
-    run(args)
