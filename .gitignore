@@ -5,6 +5,7 @@ __pycache__
 *.egg-info
 .ipynb_checkpoints
 outputs/
+output/
 datasets/*
 !datasets/sacre_coeur/
 datasets/sacre_coeur/query
