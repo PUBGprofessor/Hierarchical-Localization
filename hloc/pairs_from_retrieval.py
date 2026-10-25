@@ -12,6 +12,8 @@ from .utils.io import list_h5_names
 from .utils.parsers import parse_image_lists
 from .utils.read_write_model import read_images_binary
 
+# 全局检索阶段：读取全局描述子，计算查询图与数据库图的相似度并选出 Top-K。
+
 
 def parse_names(prefix, names, names_all):
     if prefix is not None:
@@ -53,6 +55,7 @@ def pairs_from_score_matrix(
     num_select: int,
     min_score: Optional[float] = None,
 ):
+    """对每行相似度选取有效 Top-K，返回 (查询索引, 数据库索引) 列表。"""
     assert scores.shape == invalid.shape
     if isinstance(scores, np.ndarray):
         scores = torch.from_numpy(scores)
@@ -82,6 +85,12 @@ def main(
     db_model=None,        # (可选) COLMAP 参考模型路径。如果提供，只检索模型里存在的图片
     db_descriptors=None,  # (可选) 数据库图像的全局特征文件 (如果与 descriptors 分开存储)
 ):
+    """生成检索配对文本。
+
+    descriptors 是查询图全局特征 H5；db_descriptors 可单独指定数据库特征。
+    db_model 若提供，会将检索范围限制为 COLMAP 模型中已注册的图像。
+    输出每行是“query_name db_name”，可直接传给 match_features.main。
+    """
     logger.info("Extracting image pairs from a retrieval database.")
 
     # 1. 处理数据库特征文件路径

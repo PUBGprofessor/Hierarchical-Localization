@@ -10,6 +10,7 @@ from .parsers import names_to_pair, names_to_pair_old
 
 
 def read_image(path, grayscale=False):
+    """读取图像；彩色图由 OpenCV 的 BGR 转为 RGB，且不自动旋转方向。"""
     if grayscale:
         mode = cv2.IMREAD_GRAYSCALE
     else:
@@ -44,6 +45,7 @@ def list_h5_names(path):
 def get_keypoints(
     path: Path, name: str, return_uncertainty: bool = False
 ) -> np.ndarray:
+    """读取 HDF5 中指定图片的关键点，可同时返回关键点定位不确定度。"""
     with h5py.File(str(path), "r", libver="latest") as hfile:
         dset = hfile[name]["keypoints"]
         p = dset.__array__()
@@ -74,6 +76,7 @@ def find_pair(hfile: h5py.File, name0: str, name1: str):
 
 
 def get_matches(path: Path, name0: str, name1: str) -> Tuple[np.ndarray]:
+    """读取一对图的匹配，统一返回 N×2 索引和对应分数；必要时反转顺序。"""
     with h5py.File(str(path), "r", libver="latest") as hfile:
         pair, reverse = find_pair(hfile, name0, name1)
         matches = hfile[pair]["matches0"].__array__()
@@ -89,6 +92,7 @@ def get_matches(path: Path, name0: str, name1: str) -> Tuple[np.ndarray]:
 def write_poses(
     poses: Mapping[str, pycolmap.Rigid3d], path: str, prepend_camera_name: bool
 ):
+    """将 COLMAP 相机位姿写为基准常用格式：图名、qw qx qy qz、tx ty tz。"""
     with open(path, "w") as f:
         for query, t in poses.items():
             qvec = " ".join(map(str, t.rotation.quat[[3, 0, 1, 2]]))

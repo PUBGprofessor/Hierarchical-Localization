@@ -7,6 +7,7 @@ from torch import nn
 
 
 class BaseModel(nn.Module, metaclass=ABCMeta):
+    """特征提取器和匹配器共用的模型接口与输入校验基类。"""
     default_conf = {}
     required_inputs = []
 
@@ -36,6 +37,7 @@ class BaseModel(nn.Module, metaclass=ABCMeta):
 
 
 def dynamic_load(root, model):
+    """按模块名动态导入 root 下的模型类，并返回唯一的 BaseModel 子类。"""
     module_path = f"{root.__name__}.{model}"
     module = __import__(module_path, fromlist=[""])
     classes = inspect.getmembers(module, inspect.isclass)

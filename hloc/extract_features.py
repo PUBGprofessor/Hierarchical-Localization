@@ -18,7 +18,11 @@ from .utils.base_model import dynamic_load
 from .utils.io import list_h5_names, read_image
 from .utils.parsers import parse_image_lists
 
-"""
+"""按配置提取局部关键点/描述子或整图全局描述子，并写入 HDF5。
+
+局部特征通常包含 keypoints、descriptors、scores；全局特征通常包含
+global_descriptor。extract_features.confs 中的配置决定加载哪个模型。
+
 A set of standard configurations that can be directly selected from the command
 line using their name. Each is a dictionary with the following entries:
     - output: the name of the feature file that will be generated.
@@ -239,7 +243,8 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         """
-        读取并预处理单张图片。
+        读取并预处理单张图片；输出 image 为 CxHxW、范围 [0, 1] 的数组，
+        original_size 按 (宽, 高) 保存，供提取后恢复关键点坐标。
         """
         name = self.names[idx]
         
@@ -298,6 +303,11 @@ def main(
     feature_path: Optional[Path] = None,           # 直接指定输出文件路径（覆盖 export_dir 逻辑）
     overwrite: bool = False,                       # 是否覆盖已存在的特征文件
 ) -> Path:
+    """批量提取指定图像的特征并追加写入 HDF5，返回特征文件路径。
+
+    conf 通常直接取 confs 中的配置；image_list 可限制处理图片，overwrite
+    控制是否重算已存在的条目。feature_path 可用于显式指定输出文件。
+    """
    # 打印当前的提取配置信息
     logger.info(
         "Extracting local features with configuration:" f"\n{pprint.pformat(conf)}"

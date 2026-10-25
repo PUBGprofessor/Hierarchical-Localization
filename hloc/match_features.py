@@ -114,6 +114,7 @@ class WorkQueue:
 
 
 class FeaturePairsDataset(torch.utils.data.Dataset):
+    """按配对从 HDF5 读取两幅图的局部特征，组装成匹配器输入。"""
     def __init__(self, pairs, feature_path_q, feature_path_r):
         """
         初始化数据集
@@ -164,6 +165,7 @@ class FeaturePairsDataset(torch.utils.data.Dataset):
 
 
 def writer_fn(inp, match_path):
+    """将匹配器输出的 matches0 及可选置信度写入配对对应的 HDF5 组。"""
     pair, pred = inp
     with h5py.File(str(match_path), "a", libver="latest") as fd:
         if pair in fd:
@@ -185,6 +187,11 @@ def main(
     features_ref: Optional[Path] = None, # 参考图像的特征文件路径 (如果为 None，则默认与 features 相同)
     overwrite: bool = False,           # 是否覆盖已存在的匹配文件
 ) -> Path:
+    """按 pairs 列表执行局部特征匹配并返回匹配 HDF5 路径。
+
+    features 可传特征文件名（配合 export_dir）或完整路径；features_ref
+    用于查询集与参考集分开存储的场景。配对格式由 pairs_from_retrieval 等生成。
+    """
     
     # 逻辑分支 A：如果用户直接提供了具体的特征文件路径
     # isinstance(features, Path): 用户传的是 Path 对象
@@ -260,6 +267,7 @@ def match_from_paths(
     feature_path_ref: Path,   # 参考图像的特征文件 (.h5)
     overwrite: bool = False,  # 是否覆盖已有结果
 ) -> Path:
+    """加载匹配器、逐对推理，并由后台写入线程保存未计算的配对。"""
     
     # 打印当前使用的匹配配置（如 SuperGlue 的 weights, sinkhorn_iterations 等）
     logger.info(

@@ -26,6 +26,7 @@ def sample_descriptors_fix_sampling(keypoints, descriptors, s: int = 8):
 
 
 class SuperPoint(BaseModel):
+    """局部特征提取器：输出关键点、描述子和检测分数。"""
     default_conf = {
         "nms_radius": 4,
         "keypoint_threshold": 0.005,
@@ -42,4 +43,5 @@ class SuperPoint(BaseModel):
         self.net = superpoint.SuperPoint(conf)
 
     def _forward(self, data):
+        """接收 BaseModel 约定的 image 张量，返回 SuperPoint 特征字典。"""
         return self.net(data)

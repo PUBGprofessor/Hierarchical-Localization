@@ -16,6 +16,7 @@ from .utils.parsers import parse_image_lists, parse_retrieval
 def do_covisibility_clustering(
     frame_ids: List[int], reconstruction: pycolmap.Reconstruction
 ):
+    """按共享 3D 点的共视关系，把候选参考图划分为连通簇并按大小排序。"""
     clusters = []
     visited = set()
     for frame_id in frame_ids:
@@ -51,11 +52,13 @@ def do_covisibility_clustering(
 
 
 class QueryLocalizer:
+    """封装 pycolmap 的绝对位姿估计与位姿细化（PnP/RANSAC）调用。"""
     def __init__(self, reconstruction, config=None):
         self.reconstruction = reconstruction
         self.config = config or {}
 
     def localize(self, points2D_all, points2D_idxs, points3D_id, query_camera):
+        """根据查询图 2D 点索引及对应 3D 点 ID，估计查询相机的世界位姿。"""
         points2D = points2D_all[points2D_idxs]
         points3D = [self.reconstruction.points3D[j].xyz for j in points3D_id]
         if points2D.shape[0] == 0:
@@ -79,6 +82,11 @@ def pose_from_cluster(
     matches_path: Path,              # 匹配结果文件路径 (.h5)
     **kwargs,                        # 传递给 PnP 求解器的额外参数 (如 RANSAC 阈值)
 ):
+    """融合一组参考图的局部匹配与 SfM 轨迹，构造 2D-3D 对应并运行 PnP。
+
+    返回 (位姿结果或 None, 调试日志)。候选图应属于传入的 reconstruction，
+    且 features/matches 与检索配对使用同一套相对图像名。
+    """
     # --- 1. 准备查询图的特征点 ---
     # 从 h5 文件读取查询图的 2D 关键点坐标
     kpq = get_keypoints(features_path, qname)
@@ -200,6 +208,7 @@ def main(
     prepend_camera_name: bool = False,     # 输出格式选项 (是否在文件名前加相机名)
     config: Dict = None,        # 其他配置参数
 ):
+    """对查询列表逐图定位，并写出位姿文本及配套的 pickle 调试日志。"""
     # 0. 基础检查
     assert retrieval.exists(), retrieval
     assert features.exists(), features

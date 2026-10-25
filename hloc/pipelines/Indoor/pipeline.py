@@ -175,7 +175,8 @@ def run(args):
     if map_names & set(query_names):
         raise ValueError("Map and query image names must be distinct")
 
-    retrieval_conf = extract_features.confs["netvlad"]
+    # retrieval_conf = extract_features.confs["netvlad"]
+    retrieval_conf = extract_features.confs["megaloc"]
     feature_conf = extract_features.confs["superpoint_my"]
     matcher_conf = match_features.confs["superpoint+lightglue"]
     # Keep map and query descriptors in their respective dataset directories.
@@ -198,7 +199,8 @@ def run(args):
     if not (reference_sfm / "images.bin").is_file():
         triangulation.main(reference_sfm, map_model, map_images, sfm_pairs, map_local, sfm_matches)
 
-    loc_pairs = query_output / f"pairs-query-netvlad{args.num_loc}.txt"
+    # loc_pairs = query_output / f"pairs-query-netvlad{args.num_loc}.txt"
+    loc_pairs = query_output / f"pairs-query-megaloc{args.num_loc}.txt"
     # Retrieval sees only query descriptors and registered map images.
     pairs_from_retrieval.main(
         query_global, loc_pairs, min(args.num_loc, len(map_names)),
@@ -208,7 +210,8 @@ def run(args):
         raise ValueError("No retrieval pairs; check the descriptors and map model")
     loc_matches = match_features.main(
         matcher_conf, loc_pairs, query_local, features_ref=map_local,
-        matches=query_output / f"{matcher_conf['output']}-netvlad{args.num_loc}.h5",
+        # matches=query_output / f"{matcher_conf['output']}-netvlad{args.num_loc}.h5",
+        matches=query_output / f"{matcher_conf['output']}-megaloc{args.num_loc}.h5",
     )
     combined_features = query_output / f"{feature_conf['output']}-combined.h5"
     link_features(query_local, map_local, combined_features)
@@ -228,7 +231,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--map-dir", type=Path, default=dataset_path("Indoor_map_51"))
     parser.add_argument("--query-dir", type=Path, default=dataset_path("Indoor_query_38_38"))
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Indoor127")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Indoor127_megaloc")
     parser.add_argument("--num-covis", type=int, default=20)
     parser.add_argument("--num-loc", type=int, default=10)
     arguments = parser.parse_args()

@@ -14,6 +14,11 @@ from ... import (
 
 
 def run(args):
+    """Aachen v1.1 定位示例：NetVLAD 检索、局部匹配、SfM 模型位姿估计。
+
+    本文件中部分参考模型准备步骤目前被注释；运行前需确认 reference_sfm
+    和数据库配对文件已准备好。其他数据集 pipeline 通常复用相同核心 API。
+    """
     # Setup the paths
     dataset = args.dataset  # 这里是dataset/aachen_v1.1
     images = dataset / "images_upright/"  # dataset/aachen_v1.1/images_upright/

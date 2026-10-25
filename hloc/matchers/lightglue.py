@@ -4,6 +4,7 @@ from ..utils.base_model import BaseModel
 
 
 class LightGlue(BaseModel):
+    """LightGlue 局部特征匹配器，输出两图关键点之间的对应索引。"""
     default_conf = {
         "features": "superpoint",
         "depth_confidence": 0.95,
@@ -25,6 +26,7 @@ class LightGlue(BaseModel):
             self.net.compile()
 
     def _forward(self, data):
+        """整理成 LightGlue 所需的 image0/image1 字典并执行匹配。"""
         data["descriptors0"] = data["descriptors0"].transpose(-1, -2)
         data["descriptors1"] = data["descriptors1"].transpose(-1, -2)
 

@@ -178,6 +178,7 @@ def run_triangulation(
     verbose: bool = False,
     options: Optional[Dict[str, Any]] = None,
 ) -> pycolmap.Reconstruction:
+    """固定参考模型中的相机位姿，根据数据库中的匹配三角化新的 3D 点。"""
     model_path.mkdir(parents=True, exist_ok=True)
     logger.info("Running 3D triangulation...")
     if options is None:
@@ -202,6 +203,10 @@ def main(
     verbose: bool = False,            # 是否打印详细日志
     mapper_options: Optional[Dict[str, Any]] = None, # COLMAP 建图器的详细参数
 ) -> pycolmap.Reconstruction:
+    """将 HLoc 特征与匹配导入 COLMAP 数据库，几何验证后执行三角化。
+
+    适用于已有相机位姿的参考模型；若从无到有重建，则使用 reconstruction.main。
+    """
     
     # 0. 基础检查：确保输入文件都存在
     assert reference_model.exists(), reference_model

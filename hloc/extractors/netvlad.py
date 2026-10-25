@@ -26,6 +26,7 @@ class NetVLADLayer(nn.Module):
         self.output_dim = input_dim * K
 
     def forward(self, x):
+        """将 CNN 局部特征聚合为固定长度且 L2 归一化的全局向量。"""
         b = x.size(0)
         scores = self.score_proj(x)
         scores = F.softmax(scores, dim=1)
@@ -40,6 +41,7 @@ class NetVLADLayer(nn.Module):
 
 
 class NetVLAD(BaseModel):
+    """NetVLAD 全局图像描述子，用于大规模数据库的粗粒度图像检索。"""
     default_conf = {"model_name": "VGG16-NetVLAD-Pitts30K", "whiten": True}
     required_inputs = ["image"]
 
@@ -124,6 +126,7 @@ class NetVLAD(BaseModel):
         }
 
     def _forward(self, data):
+        """提取 VGG 特征并聚合为 global_descriptor，供检索模块计算相似度。"""
         image = data["image"]
         assert image.shape[1] == 3
         assert image.min() >= -EPS and image.max() <= 1 + EPS
