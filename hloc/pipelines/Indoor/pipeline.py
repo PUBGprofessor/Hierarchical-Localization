@@ -188,6 +188,7 @@ def run(args):
     sfm_pairs = map_output / f"pairs-covis{args.num_covis}.txt"
     # Original map 2D indices are not SuperPoint indices. Match covisible map
     # images and triangulate SuperPoint landmarks at the known map poses.
+    # 对 map数据集 使用superpoint+lightglue匹配共视图像对，生成sfm_pairs文件
     pairs_from_covisibility.main(map_model, sfm_pairs, num_matched=args.num_covis)
     if not sfm_pairs.stat().st_size:
         raise ValueError("No covisible map images; cannot triangulate landmarks")
