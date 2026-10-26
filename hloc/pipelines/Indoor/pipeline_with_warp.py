@@ -1,7 +1,21 @@
-"""Localize Indoor_query_38_38 using only Indoor_map_51 poses and query intrinsics.
+"""使用共视区域裁剪完成 Indoor query 图像定位的主流程。
 
-Query ground-truth poses in sparse/0/images.txt are read only after localization,
-inside evaluate(). This dataset has one shared query camera in cameras.txt.
+与原始 HLoc pipeline 的主要区别是局部匹配阶段：原流程把完整 query
+图像和完整 map 候选图像的 SuperPoint 特征交给 LightGlue；本流程先用
+query 的外部估计位姿和 map SfM 3D 点计算每个图像对的共视掩膜，只把
+掩膜内的关键点和描述子交给 LightGlue。
+
+完整步骤：
+  1. 检查数据集、相机和已有 HLoc 中间结果；
+  2. 读取已有 MegaLoc top-k retrieval pairs；
+  3. 对每个 query/map 对进行 3D 点可见性筛选和像素共视裁剪；
+  4. 删除共享 3D 点为 0 的无关候选；
+  5. 对剩余候选执行掩膜局部特征匹配；
+  6. 将匹配结果送入原有 localize_sfm，执行 2D-3D 建立和 PnP/RANSAC；
+  7. 输出位姿、日志和评估结果。
+
+query 的 ground-truth 位姿只在定位完成后的 ``evaluate`` 中读取，绝不
+参与共视裁剪或 PnP。
 """
 
 import argparse
@@ -35,7 +49,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def dataset_path(name):
-    """Support datasets next to the repo and the local Datasets layout."""
+    """按仓库目录或本机 Datasets 目录查找数据集。"""
     for path in (ROOT / name, ROOT.parent.parent / "Datasets" / name):
         if path.is_dir():
             return path
@@ -43,7 +57,11 @@ def dataset_path(name):
 
 
 def model_images(model):
-    """Read a COLMAP text model; only call with query_model during evaluation."""
+    """读取 COLMAP 文本模型中的图像记录。
+
+    主流程只用 map 模型建立参考图像集合；query 模型的图像位姿记录仅
+    在评估阶段读取，用于和预测位姿计算误差。
+    """
     path = model / "images.txt"
     if not path.is_file():
         raise FileNotFoundError(f"Expected COLMAP text model: {path}")
@@ -51,7 +69,10 @@ def model_images(model):
 
 
 def prepare_queries(model, image_dir, output):
-    """Build HLoc's query list from image files and intrinsics, not GT poses."""
+    """生成 HLoc 查询列表文件，只写入图像名和相机内参。
+
+    该文件不包含 query 外参，因此不会把 query 的真值位姿泄漏给定位器。
+    """
     cameras = read_cameras_text(model / "cameras.txt")
     if len(cameras) != 1:
         raise ValueError("Query cameras.txt must contain one shared camera")
@@ -75,7 +96,7 @@ def prepare_queries(model, image_dir, output):
 
 
 def link_features(query_features, map_features, output):
-    """Expose both feature files to HLoc without duplicating descriptor data."""
+    """创建合并特征 H5 的外部链接，不复制或修改原始特征数据。"""
     with h5py.File(query_features, "r") as query_file, h5py.File(map_features, "r") as map_file:
         query_names, map_names = set(query_file), set(map_file)
         if query_names & map_names:
@@ -88,7 +109,7 @@ def link_features(query_features, map_features, output):
 
 
 def evaluate(results, query_model, query_names, output):
-    """Compare predicted and GT w2c poses; report PnP and fallback separately."""
+    """比较预测和真值 w2c 位姿，并分别统计 PnP 与回退结果。"""
     # This is the first read of query images.txt, after localize_sfm has returned.
     ground_truth = {image.name: image for image in model_images(query_model).values()}
     with open(f"{results}_logs.pkl", "rb") as handle:
@@ -153,7 +174,11 @@ def evaluate(results, query_model, query_names, output):
 
 
 def run(args):
-    """Reuse HLoc artifacts and localize with pair-specific covisibility masks."""
+    """复用已有 HLoc 中间结果，按图像对共视区域完成定位。
+
+    新建的配对文件、掩膜匹配文件、位姿和评估报告都写入
+    ``args.output_dir``；数据集目录中的原始特征和旧匹配文件只读使用。
+    """
     map_dir, query_dir = args.map_dir.resolve(), args.query_dir.resolve()
     map_model, query_model = map_dir / "sparse" / "0", query_dir / "sparse" / "0"
     map_images, query_images = map_dir / "images", query_dir / "images"
@@ -177,10 +202,11 @@ def run(args):
     if map_names & set(query_names):
         raise ValueError("Map and query image names must be distinct")
 
+    # 这里只用配置中的 output 名称定位已有 H5，不重新提取局部特征。
     feature_conf = extract_features.confs["superpoint_my"]
     matcher_conf = match_features.confs["superpoint+lightglue"]
-    # Read-only reuse of the previously generated local/global features and
-    # triangulated SuperPoint reference model. All new products live in output.
+    # 只读复用已有局部特征、三角化 SfM 模型和 MegaLoc 检索结果。缺失时
+    # 直接报错，避免主流程悄悄覆盖数据集目录中的旧中间结果。
     map_local = map_output / f"{feature_conf['output']}.h5"
     query_local = query_output / f"{feature_conf['output']}.h5"
     reference_sfm = map_output / f"sfm-{feature_conf['output']}-covis{args.num_covis}"
@@ -190,8 +216,8 @@ def run(args):
             raise FileNotFoundError(f"Required existing HLoc artifact: {artifact}")
     if not loc_pairs.stat().st_size:
         raise ValueError("No retrieval pairs; check the descriptors and map model")
-    # Candidate pairs remain the existing MegaLoc top-k retrieval. The masks
-    # use estimated reloc3r query poses and map-observed 3D landmarks, never GT.
+    # 候选仍来自已有 MegaLoc top-k。共视掩膜使用 reloc3r 估计的 query
+    # 位姿与 map 观测到的 3D 点，绝不使用 query 真值位姿。
     estimated_poses = args.estimated_poses.resolve()
     query_camera = next(iter(read_cameras_text(query_model / "cameras.txt").values()))
     mask_cache = {}
@@ -203,8 +229,8 @@ def run(args):
                 qname, mname, estimated_poses, map_model, query_camera, margin=args.margin)
         return mask_cache[key]
 
-    # Reject candidates with zero shared map-observed 3D points before local
-    # feature matching. The filtered retrieval file is also what PnP receives.
+    # 第一层几何过滤：零共享 3D 点意味着候选 map 图像与 query 没有
+    # 共视支持。该候选既不进入 LightGlue，也不进入后续 PnP。
     filtered_pairs = final_output / f"pairs-query-megaloc{args.num_loc}-covis.txt"
     raw_retrieval = parse_retrieval(loc_pairs)
     retained = {}
@@ -225,6 +251,8 @@ def run(args):
     logger.info("Covisibility filter: kept %d pairs, rejected %d zero-point pairs; %d queries retain candidates",
                 sum(map(len, retained.values())), removed, len(retained))
 
+    # 第二层裁剪在 match_covis_features 中完成：只有每个图像对的共视
+    # 掩膜内关键点会送入 LightGlue，匹配索引随后恢复到原始 H5 索引。
     loc_matches = final_output / "matches-covis-megaloc10.h5"
     match_covis_features.main(
         matcher_conf, filtered_pairs, query_local, map_local, loc_matches,
@@ -245,15 +273,27 @@ def run(args):
 
 
 if __name__ == "__main__":
+    # 默认路径对应本次 Indoor 共视定位实验；也可以通过命令行替换数据集
+    # 和输出目录。运行时应使用包含 PyTorch/LightGlue 依赖的 dl 环境。
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--map-dir", type=Path, default=dataset_path("Indoor_map_51"))
     parser.add_argument("--query-dir", type=Path, default=dataset_path("Indoor_query_38_38"))
     parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Indoor_127_covis" / "alll_pipeline")
     parser.add_argument("--num-covis", type=int, default=20)
     parser.add_argument("--num-loc", type=int, default=10)
-    parser.add_argument("--estimated-poses", type=Path, default=ROOT / "output/reloc3r_Indoor127_megaloc/query_poses.txt")
-    parser.add_argument("--margin", type=int, default=50)
-    parser.add_argument("--overwrite-matches", action="store_true")
+    parser.add_argument(
+        "--estimated-poses", type=Path,
+        default=ROOT / "output/reloc3r_Indoor127_megaloc/query_poses.txt",
+        help="query 的估计 COLMAP w2c 位姿文件，不是 query 真值文件",
+    )
+    parser.add_argument(
+        "--margin", type=int, default=50,
+        help="投影凸包向外扩展的像素数，补偿位姿和稀疏重建误差",
+    )
+    parser.add_argument(
+        "--overwrite-matches", action="store_true",
+        help="重新计算输出目录中已经存在的共视匹配组",
+    )
     arguments = parser.parse_args()
     if arguments.num_covis < 1 or arguments.num_loc < 1:
         parser.error("--num-covis and --num-loc must be positive")
