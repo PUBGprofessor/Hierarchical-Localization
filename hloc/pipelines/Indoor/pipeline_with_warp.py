@@ -108,9 +108,86 @@ def link_features(query_features, map_features, output):
                 combined[name] = h5py.ExternalLink(str(map_features.resolve()), name)
 
 
-def evaluate(results, query_model, query_names, output):
+def read_pose_table(path):
+    """读取 COLMAP 风格位姿文本，返回 ``图像名 -> 7 个位姿数值``。
+
+    reloc3r 文件带有 ``#`` 注释头，而 localize_sfm 输出通常没有注释；
+    因此这里统一跳过空行和注释行，只接受 ``name qw qx qy qz tx ty tz``。
+    """
+    poses = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) != 8:
+            raise ValueError(f"Invalid pose line in {path}: {line}")
+        poses[fields[0]] = np.asarray([float(value) for value in fields[1:]], dtype=float)
+    return poses
+
+
+def rotation_error_deg(predicted_qvec, estimated_qvec):
+    """计算两个 COLMAP w2c 旋转之间的最小夹角（单位：度）。"""
+    predicted_rotation = qvec2rotmat(predicted_qvec)
+    estimated_rotation = qvec2rotmat(estimated_qvec)
+    relative = predicted_rotation @ estimated_rotation.T
+    cosine = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def apply_estimated_pose_fallback(results, estimated_poses, output_dir, threshold_deg=20.0):
+    """按旋转误差把明显错误的 HLoc 位姿替换为外部估计位姿。
+
+    该机制只比较旋转，不比较平移：当 HLoc 与 reloc3r 的旋转差严格
+    大于 ``threshold_deg`` 时，最终 ``query_poses.txt`` 使用 reloc3r
+    的完整 7 参数位姿。原始 HLoc 结果另存为 ``query_poses_hloc.txt``，
+    便于复盘；返回被替换的图像名集合，供评估结果标记方法。
+    """
+    predicted = read_pose_table(results)
+    estimated = read_pose_table(estimated_poses)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_results = output_dir / "query_poses_hloc.txt"
+    raw_results.write_text(Path(results).read_text(encoding="utf-8"), encoding="utf-8")
+
+    fallback_names = set()
+    report = {
+        "enabled": True,
+        "rotation_threshold_deg": threshold_deg,
+        "replaced_count": 0,
+        "queries": {},
+    }
+    for name, pose in predicted.items():
+        if name not in estimated:
+            report["queries"][name] = {"status": "no_estimated_pose"}
+            continue
+        error = rotation_error_deg(pose[:4], estimated[name][:4])
+        use_estimated = error > threshold_deg
+        report["queries"][name] = {
+            "rotation_error_deg": error,
+            "status": "estimated_pose_fallback" if use_estimated else "hloc",
+        }
+        if use_estimated:
+            predicted[name] = estimated[name]
+            fallback_names.add(name)
+
+    # 按原 HLoc 图像顺序重写最终文件，只替换位姿数值，不改图像名。
+    output_lines = [
+        f"{name} " + " ".join(map(str, pose)) for name, pose in predicted.items()
+    ]
+    Path(results).write_text("\n".join(output_lines) + ("\n" if output_lines else ""), encoding="utf-8")
+    report["replaced_count"] = len(fallback_names)
+    (output_dir / "fallback_report.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8")
+    logger.info(
+        "Estimated-pose fallback: replaced %d/%d HLoc poses when rotation error exceeded %.1f deg",
+        len(fallback_names), len(predicted), threshold_deg,
+    )
+    return fallback_names
+
+
+def evaluate(results, query_model, query_names, output, fallback_names=None):
     """比较预测和真值 w2c 位姿，并分别统计 PnP 与回退结果。"""
     # This is the first read of query images.txt, after localize_sfm has returned.
+    fallback_names = fallback_names or set()
     ground_truth = {image.name: image for image in model_images(query_model).values()}
     with open(f"{results}_logs.pkl", "rb") as handle:
         logs = pickle.load(handle)["loc"]
@@ -129,8 +206,9 @@ def evaluate(results, query_model, query_names, output):
         translation = rotation = None
         if prediction is not None:
             method = (
-                "pnp" if logs.get(name, {}).get("PnP_ret") is not None
-                else "retrieval_fallback"
+                "estimated_pose_fallback" if name in fallback_names
+                else ("pnp" if logs.get(name, {}).get("PnP_ret") is not None
+                      else "retrieval_fallback")
             )
             gt_rotation = image.qvec2rotmat()
             predicted_rotation = qvec2rotmat(prediction[:4])
@@ -160,6 +238,7 @@ def evaluate(results, query_model, query_names, output):
     summary = {
         "total_queries": len(rows),
         "pnp_localized": len(pnp),
+        "estimated_pose_fallback": len(fallback_names),
         "retrieval_fallback": sum(row["method"] == "retrieval_fallback" for row in rows),
         "missing": len(rows) - len(estimated),
         "all_estimated": metrics(estimated),
@@ -268,7 +347,23 @@ def run(args):
         reference_sfm, query_list, filtered_pairs, combined_features, loc_matches, results,
         covisibility_clustering=False,
     )
-    evaluate(results, query_model, query_names, final_output / "evaluation.json")
+    # 可选兜底：只在 HLoc 位姿与 reloc3r 估计位姿的旋转差超过阈值时
+    # 替换最终位姿。默认关闭，因此不改变原有 HLoc 结果。
+    fallback_names = set()
+    if args.use_estimated_fallback:
+        fallback_names = apply_estimated_pose_fallback(
+            results,
+            estimated_poses,
+            final_output,
+            threshold_deg=args.fallback_rotation_threshold,
+        )
+    evaluate(
+        results,
+        query_model,
+        query_names,
+        final_output / "evaluation.json",
+        fallback_names=fallback_names,
+    )
     logger.info("Poses: %s; evaluation: %s", results, final_output / "evaluation.json")
 
 
@@ -293,6 +388,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--overwrite-matches", action="store_true",
         help="重新计算输出目录中已经存在的共视匹配组",
+    )
+    parser.add_argument(
+        "--use-estimated-fallback", action="store_true",
+        help="启用旋转误差兜底：HLoc 与估计位姿差异超过阈值时使用估计位姿",
+    )
+    parser.add_argument(
+        "--fallback-rotation-threshold", type=float, default=20.0,
+        help="兜底旋转误差阈值（度），默认 20 度",
     )
     arguments = parser.parse_args()
     if arguments.num_covis < 1 or arguments.num_loc < 1:
