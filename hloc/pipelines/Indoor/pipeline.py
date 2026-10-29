@@ -188,27 +188,31 @@ def run(args):
     sfm_pairs = map_output / f"pairs-covis{args.num_covis}.txt"
     # Original map 2D indices are not SuperPoint indices. Match covisible map
     # images and triangulate SuperPoint landmarks at the known map poses.
-    # 对 map数据集 使用superpoint+lightglue匹配共视图像对，生成sfm_pairs文件
+    # 对 map数据集 使用superpoint+lightglue匹配共视图像对，生成sfm_pairs文件，用于map数据集的重建
     pairs_from_covisibility.main(map_model, sfm_pairs, num_matched=args.num_covis)
     if not sfm_pairs.stat().st_size:
         raise ValueError("No covisible map images; cannot triangulate landmarks")
+     # 使用上一步生成的匹配对，进行特征匹配（LightGlue）。
     sfm_matches = match_features.main(
         matcher_conf, sfm_pairs, map_local,
         matches=map_output / f"{matcher_conf['output']}-covis{args.num_covis}.h5",
     )
     reference_sfm = map_output / f"sfm-{feature_conf['output']}-covis{args.num_covis}"
     if not (reference_sfm / "images.bin").is_file():
+        # 如果没有Hloc产生的sfm模型，则固定相机的位姿不变，使用lightglue的共视匹配对和匹配结果，进行三角化，生成sfm模型
         triangulation.main(reference_sfm, map_model, map_images, sfm_pairs, map_local, sfm_matches)
 
     # loc_pairs = query_output / f"pairs-query-netvlad{args.num_loc}.txt"
     loc_pairs = query_output / f"pairs-query-megaloc{args.num_loc}.txt"
     # Retrieval sees only query descriptors and registered map images.
+    # 生成定位用的“匹配对”: 对于每一张 Query 图，计算它和所有 Database 图的全局特征相似度，选出 Top-N
     pairs_from_retrieval.main(
         query_global, loc_pairs, min(args.num_loc, len(map_names)),
         query_list=query_names, db_descriptors=map_global, db_model=reference_sfm,
     )
     if not loc_pairs.stat().st_size:
         raise ValueError("No retrieval pairs; check the descriptors and map model")
+    # 对 Query 图和它找到的 Top-N 个“嫌疑人”进行精细匹配
     loc_matches = match_features.main(
         matcher_conf, loc_pairs, query_local, features_ref=map_local,
         # matches=query_output / f"{matcher_conf['output']}-netvlad{args.num_loc}.h5",
@@ -219,11 +223,11 @@ def run(args):
 
     results = final_output / "query_poses.txt"
     # PnP uses query intrinsics, query keypoints, map keypoints, and map 3D points.
-    # Query ground-truth poses are never an input to this call.
     localize_sfm.main(
         reference_sfm, query_list, loc_pairs, combined_features, loc_matches, results,
         covisibility_clustering=False,
     )
+    # 评估位姿结果
     evaluate(results, query_model, query_names, final_output / "evaluation.json")
     logger.info("Poses: %s; evaluation: %s", results, final_output / "evaluation.json")
 

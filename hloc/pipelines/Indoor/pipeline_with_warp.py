@@ -108,6 +108,23 @@ def link_features(query_features, map_features, output):
                 combined[name] = h5py.ExternalLink(str(map_features.resolve()), name)
 
 
+def h5_contains_images(path, image_names):
+    """判断特征 H5 是否存在且包含本次所需的全部图像 group。
+
+    只检查文件存在是不够的：上一次提取可能被中断，留下一个非空但不
+    完整的 H5。发现缺少 group 时仍调用 ``extract_features.main``，它会
+    复用已有 group 并只追加缺少的图像。
+    """
+    path = Path(path)
+    if not path.is_file() or not path.stat().st_size:
+        return False
+    try:
+        with h5py.File(path, "r") as handle:
+            return all(name in handle for name in image_names)
+    except (OSError, ValueError):
+        return False
+
+
 def read_pose_table(path):
     """读取 COLMAP 风格位姿文本，返回 ``图像名 -> 7 个位姿数值``。
 
@@ -134,13 +151,20 @@ def rotation_error_deg(predicted_qvec, estimated_qvec):
     return float(np.degrees(np.arccos(cosine)))
 
 
-def apply_estimated_pose_fallback(results, estimated_poses, output_dir, threshold_deg=20.0):
-    """按旋转误差把明显错误的 HLoc 位姿替换为外部估计位姿。
+def apply_estimated_pose_fallback(
+    results, estimated_poses, output_dir, threshold_deg=25.0
+):
+    """按 PnP 是否成功和旋转误差替换明显错误的 HLoc 位姿。
 
-    该机制只比较旋转，不比较平移：当 HLoc 与 reloc3r 的旋转差严格
-    大于 ``threshold_deg`` 时，最终 ``query_poses.txt`` 使用 reloc3r
-    的完整 7 参数位姿。原始 HLoc 结果另存为 ``query_poses_hloc.txt``，
-    便于复盘；返回被替换的图像名集合，供评估结果标记方法。
+    ``localize_sfm`` 在 PnP 失败时会把 top1 map 图像的位姿写入结果，
+    同时在 ``query_poses.txt_logs.pkl`` 中将 ``PnP_ret`` 置为 ``None``。
+    因此这里有两个独立的触发条件：
+
+    1. ``PnP_ret is None``，表示当前结果是 top1 回退位姿；
+    2. HLoc 与 reloc3r 估计位姿的旋转误差严格大于 ``threshold_deg``。
+
+    任一条件成立且存在对应的 reloc3r 位姿，就使用 reloc3r 的完整 7
+    参数位姿。原始 HLoc 结果另存为 ``query_poses_hloc.txt``。
     """
     predicted = read_pose_table(results)
     estimated = read_pose_table(estimated_poses)
@@ -148,10 +172,17 @@ def apply_estimated_pose_fallback(results, estimated_poses, output_dir, threshol
     raw_results = output_dir / "query_poses_hloc.txt"
     raw_results.write_text(Path(results).read_text(encoding="utf-8"), encoding="utf-8")
 
+    logs_path = Path(f"{results}_logs.pkl")
+    if not logs_path.is_file():
+        raise FileNotFoundError(f"localize_sfm log is required for PnP fallback detection: {logs_path}")
+    with logs_path.open("rb") as handle:
+        localization_logs = pickle.load(handle).get("loc", {})
+
     fallback_names = set()
     report = {
         "enabled": True,
         "rotation_threshold_deg": threshold_deg,
+        "triggers": ["pnp_failed", "rotation_error_exceeded"],
         "replaced_count": 0,
         "queries": {},
     }
@@ -160,9 +191,19 @@ def apply_estimated_pose_fallback(results, estimated_poses, output_dir, threshol
             report["queries"][name] = {"status": "no_estimated_pose"}
             continue
         error = rotation_error_deg(pose[:4], estimated[name][:4])
-        use_estimated = error > threshold_deg
+        # PnP_ret 缺失正是 localize_sfm 使用 top1 位姿兜底的标志。
+        pnp_failed = localization_logs.get(name, {}).get("PnP_ret") is None
+        rotation_exceeded = error > threshold_deg
+        use_estimated = pnp_failed or rotation_exceeded
+        triggers = []
+        if pnp_failed:
+            triggers.append("pnp_failed")
+        if rotation_exceeded:
+            triggers.append("rotation_error_exceeded")
         report["queries"][name] = {
             "rotation_error_deg": error,
+            "pnp_failed": pnp_failed,
+            "triggers": triggers,
             "status": "estimated_pose_fallback" if use_estimated else "hloc",
         }
         if use_estimated:
@@ -178,7 +219,7 @@ def apply_estimated_pose_fallback(results, estimated_poses, output_dir, threshol
     (output_dir / "fallback_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8")
     logger.info(
-        "Estimated-pose fallback: replaced %d/%d HLoc poses when rotation error exceeded %.1f deg",
+        "Estimated-pose fallback: replaced %d/%d HLoc poses (PnP failure or rotation error > %.1f deg)",
         len(fallback_names), len(predicted), threshold_deg,
     )
     return fallback_names
@@ -277,24 +318,75 @@ def run(args):
         if not (map_images / name).is_file():
             raise FileNotFoundError(map_images / name)
     query_list = final_output / "queries_with_intrinsics.txt"
-    query_names = prepare_queries(query_model, query_images, query_list)
+    # 查询列表也是可复用的中间结果：存在且非空时直接读取，避免每次
+    # 运行都重新写文件；缺失时才按照 query 相机内参重新生成。
+    if query_list.is_file() and query_list.stat().st_size:
+        query_names = [line.split()[0] for line in query_list.read_text(encoding="utf-8").splitlines() if line.strip()]
+    else:
+        query_names = prepare_queries(query_model, query_images, query_list)
     if map_names & set(query_names):
         raise ValueError("Map and query image names must be distinct")
 
-    # 这里只用配置中的 output 名称定位已有 H5，不重新提取局部特征。
+    # 配置中的 output 名称用于确定中间文件路径。下面每个文件都采用
+    # “存在则复用、缺失才生成”的策略，生成逻辑与原 pipeline 一致。
     feature_conf = extract_features.confs["superpoint_my"]
+    retrieval_conf = extract_features.confs["megaloc"]
     matcher_conf = match_features.confs["superpoint+lightglue"]
-    # 只读复用已有局部特征、三角化 SfM 模型和 MegaLoc 检索结果。缺失时
-    # 直接报错，避免主流程悄悄覆盖数据集目录中的旧中间结果。
+
     map_local = map_output / f"{feature_conf['output']}.h5"
+    map_global = map_output / f"{retrieval_conf['output']}.h5"
     query_local = query_output / f"{feature_conf['output']}.h5"
+    query_global = query_output / f"{retrieval_conf['output']}.h5"
+
+    if not h5_contains_images(map_local, map_names):
+        logger.info("Map local features missing; extracting SuperPoint features: %s", map_local)
+        map_local = extract_features.main(
+            feature_conf, map_images, map_output, image_list=sorted(map_names))
+    if not h5_contains_images(map_global, map_names):
+        logger.info("Map global features missing; extracting MegaLoc features: %s", map_global)
+        map_global = extract_features.main(
+            retrieval_conf, map_images, map_output, image_list=sorted(map_names))
+    if not h5_contains_images(query_local, query_names):
+        logger.info("Query local features missing; extracting SuperPoint features: %s", query_local)
+        query_local = extract_features.main(
+            feature_conf, query_images, query_output, image_list=query_names)
+    if not h5_contains_images(query_global, query_names):
+        logger.info("Query global features missing; extracting MegaLoc features: %s", query_global)
+        query_global = extract_features.main(
+            retrieval_conf, query_images, query_output, image_list=query_names)
+
     reference_sfm = map_output / f"sfm-{feature_conf['output']}-covis{args.num_covis}"
+    sfm_pairs = map_output / f"pairs-covis{args.num_covis}.txt"
+    if not sfm_pairs.is_file() or not sfm_pairs.stat().st_size:
+        logger.info("Map covisibility pairs missing; generating: %s", sfm_pairs)
+        pairs_from_covisibility.main(map_model, sfm_pairs, num_matched=args.num_covis)
+    if not sfm_pairs.stat().st_size:
+        raise ValueError("No covisible map image pairs; cannot triangulate landmarks")
+
+    sfm_matches = map_output / f"{matcher_conf['output']}-covis{args.num_covis}.h5"
+    if not sfm_matches.is_file() or not sfm_matches.stat().st_size:
+        logger.info("Map covisibility matches missing; matching: %s", sfm_matches)
+        match_features.main(matcher_conf, sfm_pairs, map_local, matches=sfm_matches)
+
+    if not (reference_sfm / "images.bin").is_file() or not (reference_sfm / "images.bin").stat().st_size:
+        logger.info("Reference SfM model missing; triangulating: %s", reference_sfm)
+        triangulation.main(
+            reference_sfm, map_model, map_images, sfm_pairs, map_local, sfm_matches)
+
     loc_pairs = query_output / f"pairs-query-megaloc{args.num_loc}.txt"
-    for artifact in (map_local, query_local, reference_sfm / "images.bin", loc_pairs):
-        if not artifact.exists():
-            raise FileNotFoundError(f"Required existing HLoc artifact: {artifact}")
+    if not loc_pairs.is_file() or not loc_pairs.stat().st_size:
+        logger.info("Retrieval pairs missing; running MegaLoc retrieval: %s", loc_pairs)
+        pairs_from_retrieval.main(
+            query_global, loc_pairs, min(args.num_loc, len(map_names)),
+            query_list=query_names, db_descriptors=map_global, db_model=reference_sfm)
     if not loc_pairs.stat().st_size:
         raise ValueError("No retrieval pairs; check the descriptors and map model")
+
+    # 上述分支可能刚刚生成文件，最后统一确认所有下游输入可读。
+    for artifact in (map_local, map_global, query_local, query_global,
+                     sfm_matches, reference_sfm / "images.bin", loc_pairs):
+        if not artifact.exists() or (artifact.is_file() and not artifact.stat().st_size):
+            raise FileNotFoundError(f"HLoc artifact was not created: {artifact}")
     # 候选仍来自已有 MegaLoc top-k。共视掩膜使用 reloc3r 估计的 query
     # 位姿与 map 观测到的 3D 点，绝不使用 query 真值位姿。
     estimated_poses = args.estimated_poses.resolve()
@@ -347,8 +439,9 @@ def run(args):
         reference_sfm, query_list, filtered_pairs, combined_features, loc_matches, results,
         covisibility_clustering=False,
     )
-    # 可选兜底：只在 HLoc 位姿与 reloc3r 估计位姿的旋转差超过阈值时
-    # 替换最终位姿。默认关闭，因此不改变原有 HLoc 结果。
+    # 可选兜底：PnP 失败（localize_sfm 使用 top1 回退位姿），或者 HLoc
+    # 与 reloc3r 估计位姿的旋转差超过阈值时，替换最终位姿。默认关闭，
+    # 因此不改变原有 HLoc 结果。
     fallback_names = set()
     if args.use_estimated_fallback:
         fallback_names = apply_estimated_pose_fallback(
@@ -391,11 +484,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use-estimated-fallback", action="store_true",
-        help="启用旋转误差兜底：HLoc 与估计位姿差异超过阈值时使用估计位姿",
+        help="启用兜底：PnP 失败或旋转误差超过阈值时使用估计位姿",
     )
     parser.add_argument(
-        "--fallback-rotation-threshold", type=float, default=20.0,
-        help="兜底旋转误差阈值（度），默认 20 度",
+        "--fallback-rotation-threshold", type=float, default=25.0,
+        help="兜底旋转误差阈值（度），默认 25 度",
     )
     arguments = parser.parse_args()
     if arguments.num_covis < 1 or arguments.num_loc < 1:
