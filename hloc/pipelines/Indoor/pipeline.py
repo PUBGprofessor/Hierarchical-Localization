@@ -27,6 +27,7 @@ from hloc import (
     pairs_from_retrieval,
     triangulation,
 )
+from hloc.utils.io import list_h5_names
 from hloc.utils.read_write_model import qvec2rotmat, read_cameras_text, read_images_text
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -87,15 +88,26 @@ def prepare_queries(model, image_dir, output):
 
 def link_features(query_features, map_features, output):
     """Expose both feature files to HLoc without duplicating descriptor data."""
-    with h5py.File(query_features, "r") as query_file, h5py.File(map_features, "r") as map_file:
-        query_names, map_names = set(query_file), set(map_file)
-        if query_names & map_names:
-            raise ValueError("Query and map feature names overlap")
-        with h5py.File(output, "w") as combined:
-            for name in query_names:
-                combined[name] = h5py.ExternalLink(str(query_features.resolve()), name)
-            for name in map_names:
-                combined[name] = h5py.ExternalLink(str(map_features.resolve()), name)
+    # HDF5 files may store images below a shared top-level directory such as
+    # ``db``.  list_h5_names() returns complete image names like db/1003.jpg;
+    # checking only ``h5file.keys()`` would report a false collision on ``db``.
+    query_names = set(list_h5_names(query_features))
+    map_names = set(list_h5_names(map_features))
+    overlap = query_names & map_names
+    if overlap:
+        raise ValueError(f"Query and map feature names overlap: {sorted(overlap)[:5]}")
+
+    def add_links(combined, source, names):
+        for name in sorted(names):
+            parent = combined
+            parts = name.split("/")
+            for part in parts[:-1]:
+                parent = parent.require_group(part)
+            parent[parts[-1]] = h5py.ExternalLink(str(source.resolve()), name)
+
+    with h5py.File(output, "w") as combined:
+        add_links(combined, query_features, query_names)
+        add_links(combined, map_features, map_names)
 
 
 def evaluate(results, query_model, query_names, output):

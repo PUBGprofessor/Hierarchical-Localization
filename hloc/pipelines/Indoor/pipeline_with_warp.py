@@ -26,6 +26,7 @@ import pickle
 import sys
 from pathlib import Path
 
+from hloc.utils.io import list_h5_names
 import h5py
 import numpy as np
 
@@ -96,16 +97,28 @@ def prepare_queries(model, image_dir, output):
 
 
 def link_features(query_features, map_features, output):
-    """创建合并特征 H5 的外部链接，不复制或修改原始特征数据。"""
-    with h5py.File(query_features, "r") as query_file, h5py.File(map_features, "r") as map_file:
-        query_names, map_names = set(query_file), set(map_file)
-        if query_names & map_names:
-            raise ValueError("Query and map feature names overlap")
-        with h5py.File(output, "w") as combined:
-            for name in query_names:
-                combined[name] = h5py.ExternalLink(str(query_features.resolve()), name)
-            for name in map_names:
-                combined[name] = h5py.ExternalLink(str(map_features.resolve()), name)
+    """Expose both feature files to HLoc without duplicating descriptor data."""
+    # HDF5 files may store images below a shared top-level directory such as
+    # ``db``.  list_h5_names() returns complete image names like db/1003.jpg;
+    # checking only ``h5file.keys()`` would report a false collision on ``db``.
+    query_names = set(list_h5_names(query_features))
+    map_names = set(list_h5_names(map_features))
+    overlap = query_names & map_names
+    if overlap:
+        raise ValueError(f"Query and map feature names overlap: {sorted(overlap)[:5]}")
+
+    def add_links(combined, source, names):
+        for name in sorted(names):
+            parent = combined
+            parts = name.split("/")
+            for part in parts[:-1]:
+                parent = parent.require_group(part)
+            parent[parts[-1]] = h5py.ExternalLink(str(source.resolve()), name)
+
+    with h5py.File(output, "w") as combined:
+        add_links(combined, query_features, query_names)
+        add_links(combined, map_features, map_names)
+
 
 
 def h5_contains_images(path, image_names):
