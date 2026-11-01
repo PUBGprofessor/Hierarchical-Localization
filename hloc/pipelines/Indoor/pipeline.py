@@ -123,10 +123,26 @@ def evaluate(results, query_model, query_names, output):
             raise ValueError(f"Invalid pose in {results}: {line}")
         predictions[name] = np.asarray(pose, dtype=float)
 
+    # HLoc's write_poses() intentionally writes only the basename.  Aachen
+    # query names contain a directory prefix (for example db/1003.jpg), so
+    # evaluate both the full name and its unique basename.
+    basename_to_query = {}
+    for name in query_names:
+        basename = Path(name).name
+        if basename in basename_to_query:
+            basename_to_query[basename] = None
+        else:
+            basename_to_query[basename] = name
+
     rows = []
     for name in query_names:
         image = ground_truth[name]
         prediction = predictions.get(name)
+        if prediction is None:
+            output_name = Path(name).name
+            matched_name = basename_to_query.get(output_name)
+            if matched_name == name:
+                prediction = predictions.get(output_name)
         method = "missing"
         translation = rotation = None
         if prediction is not None:

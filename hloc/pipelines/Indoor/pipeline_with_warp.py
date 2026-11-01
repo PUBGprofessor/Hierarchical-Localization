@@ -70,14 +70,17 @@ def model_images(model):
 
 
 def prepare_queries(model, image_dir, output):
-    """生成 HLoc 查询列表文件，只写入图像名和相机内参。
+    """生成带逐图相机内参的 HLoc 查询列表，不写入 query 外参。
 
     该文件不包含 query 外参，因此不会把 query 的真值位姿泄漏给定位器。
+    COLMAP 可以为不同查询图像分配不同的 camera_id，因此不能假设只有
+    一个共享相机。
     """
     cameras = read_cameras_text(model / "cameras.txt")
-    if len(cameras) != 1:
-        raise ValueError("Query cameras.txt must contain one shared camera")
-    camera = next(iter(cameras.values()))
+    query_model_images = read_images_text(model / "images.txt")
+    name_to_camera = {
+        image.name: cameras[image.camera_id] for image in query_model_images.values()
+    }
     suffixes = {".jpg", ".jpeg", ".png"}
     names = sorted(
         path.relative_to(image_dir).as_posix()
@@ -88,6 +91,12 @@ def prepare_queries(model, image_dir, output):
         raise ValueError(f"No query images in {image_dir}")
     lines = []
     for name in names:
+        if name not in name_to_camera:
+            raise ValueError(
+                f"Image {name} is missing from COLMAP query images.txt; "
+                "cannot determine its camera intrinsics."
+            )
+        camera = name_to_camera[name]
         lines.append(
             f"{name} {camera.model} {camera.width} {camera.height} "
             + " ".join(map(str, camera.params))
@@ -252,10 +261,23 @@ def evaluate(results, query_model, query_names, output, fallback_names=None):
             raise ValueError(f"Invalid pose in {results}: {line}")
         predictions[name] = np.asarray(pose, dtype=float)
 
+    # HLoc writes only the basename (e.g. 1003.jpg), while Aachen query
+    # names can include a prefix (e.g. db/1003.jpg).
+    basename_to_query = {}
+    for name in query_names:
+        basename = Path(name).name
+        basename_to_query[basename] = (
+            name if basename not in basename_to_query else None
+        )
+
     rows = []
     for name in query_names:
         image = ground_truth[name]
         prediction = predictions.get(name)
+        if prediction is None:
+            matched_name = basename_to_query.get(Path(name).name)
+            if matched_name == name:
+                prediction = predictions.get(Path(name).name)
         method = "missing"
         translation = rotation = None
         if prediction is not None:
@@ -403,12 +425,17 @@ def run(args):
     # 候选仍来自已有 MegaLoc top-k。共视掩膜使用 reloc3r 估计的 query
     # 位姿与 map 观测到的 3D 点，绝不使用 query 真值位姿。
     estimated_poses = args.estimated_poses.resolve()
-    query_camera = next(iter(read_cameras_text(query_model / "cameras.txt").values()))
+    query_cameras = read_cameras_text(query_model / "cameras.txt")
+    query_camera_by_name = {
+        image.name: query_cameras[image.camera_id]
+        for image in model_images(query_model).values()
+    }
     mask_cache = {}
 
     def pair_masks(qname, mname):
         key = (qname, mname)
         if key not in mask_cache:
+            query_camera = query_camera_by_name[qname]
             mask_cache[key] = covis_warp.compute_pair_masks(
                 qname, mname, estimated_poses, map_model, query_camera, margin=args.margin)
         return mask_cache[key]
