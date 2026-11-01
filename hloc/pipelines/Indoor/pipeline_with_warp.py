@@ -20,10 +20,12 @@ query 的 ground-truth 位姿只在定位完成后的 ``evaluate`` 中读取，�
 
 import argparse
 import csv
+import gc
 import json
 import os
 import pickle
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from hloc.utils.io import list_h5_names
@@ -67,6 +69,31 @@ def model_images(model):
     if not path.is_file():
         raise FileNotFoundError(f"Expected COLMAP text model: {path}")
     return read_images_text(path)
+
+
+def model_image_names(model):
+    """只读取 COLMAP images.txt 的图像名，避免加载全部 2D 观测数组。
+
+    map 数据库规模较大时，完整调用 ``read_images_text`` 会为每个图像
+    创建 xys、point3D_ids 和 namedtuple；主流程这里只需要名字，因此
+    使用轻量的两行步进解析。
+    """
+    names = []
+    with (Path(model) / "images.txt").open("r", encoding="utf-8") as handle:
+        while True:
+            header = handle.readline()
+            if not header:
+                break
+            if not header.strip() or header.lstrip().startswith("#"):
+                continue
+            fields = header.split()
+            if len(fields) < 10:
+                raise ValueError(f"Invalid COLMAP image header: {header.rstrip()}")
+            names.append(fields[9])
+            # 每条图像记录紧跟一行 2D 观测，跳过它而不解析成数组。
+            if not handle.readline():
+                raise ValueError(f"Missing observations for image {fields[9]}")
+    return names
 
 
 def prepare_queries(model, image_dir, output):
@@ -346,7 +373,7 @@ def run(args):
         path.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("TORCH_HOME", str(map_output / "torch_cache"))
 
-    map_names = {image.name for image in model_images(map_model).values()}
+    map_names = set(model_image_names(map_model))
     if not map_names:
         raise ValueError(f"No reference images in {map_model}")
     for name in map_names:
@@ -430,15 +457,13 @@ def run(args):
         image.name: query_cameras[image.camera_id]
         for image in model_images(query_model).values()
     }
-    mask_cache = {}
-
+    # 每个掩膜约为 width*height 字节；不能把全部 top-k pair 的掩膜都
+    # 放在字典中。小容量 LRU 只保留最近少量 pair，控制峰值内存。
+    @lru_cache(maxsize=4)
     def pair_masks(qname, mname):
-        key = (qname, mname)
-        if key not in mask_cache:
-            query_camera = query_camera_by_name[qname]
-            mask_cache[key] = covis_warp.compute_pair_masks(
-                qname, mname, estimated_poses, map_model, query_camera, margin=args.margin)
-        return mask_cache[key]
+        query_camera = query_camera_by_name[qname]
+        return covis_warp.compute_pair_masks(
+            qname, mname, estimated_poses, map_model, query_camera, margin=args.margin)
 
     # 第一层几何过滤：零共享 3D 点意味着候选 map 图像与 query 没有
     # 共视支持。该候选既不进入 LightGlue，也不进入后续 PnP。
@@ -468,6 +493,11 @@ def run(args):
     match_covis_features.main(
         matcher_conf, filtered_pairs, query_local, map_local, loc_matches,
         mask_provider=pair_masks, overwrite=args.overwrite_matches)
+    # 共视过滤和匹配阶段结束后不再需要 3D 点投影索引。释放它，避免
+    # 与 localize_sfm 即将加载的 pycolmap Reconstruction 同时占用内存。
+    covis_warp.clear_model_cache()
+    pair_masks.cache_clear()
+    gc.collect()
     combined_features = final_output / f"{feature_conf['output']}-combined.h5"
     if not combined_features.exists():
         link_features(query_local, map_local, combined_features)
@@ -506,7 +536,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--map-dir", type=Path, default=dataset_path("Indoor_map_51"))
     parser.add_argument("--query-dir", type=Path, default=dataset_path("Indoor_query_38_38"))
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Indoor_127_covis" / "alll_pipeline")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Indoor_127_covis" / "all_pipeline")
     parser.add_argument("--num-covis", type=int, default=20)
     parser.add_argument("--num-loc", type=int, default=10)
     parser.add_argument(

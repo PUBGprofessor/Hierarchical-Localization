@@ -3,13 +3,59 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import pycolmap
 from tqdm import tqdm
 
 from . import logger
 from .utils.read_write_model import read_model
 
 
+def _main_pycolmap(model, output, num_matched):
+    """使用 pycolmap 轨迹计算共视 pairs，避免 legacy Python 模型副本。"""
+    logger.info("Reading the COLMAP model with pycolmap...")
+    reconstruction = pycolmap.Reconstruction(model)
+    images = reconstruction.images
+    image_names = {image_id: image.name for image_id, image in images.items()}
+    covis_by_image = {image_id: defaultdict(int) for image_id in images}
+    logger.info("Extracting image pairs from covisibility info...")
+    for point in tqdm(reconstruction.points3D.values()):
+        track_ids = [element.image_id for element in point.track.elements]
+        for image_id in track_ids:
+            covis = covis_by_image[image_id]
+            for other_id in track_ids:
+                if other_id != image_id:
+                    covis[other_id] += 1
+
+    pairs = []
+    for image_id, covis in tqdm(covis_by_image.items()):
+        if not covis:
+            continue
+        covis_ids = np.fromiter(covis.keys(), dtype=np.int64)
+        covis_num = np.fromiter(covis.values(), dtype=np.int64)
+        if len(covis_ids) <= num_matched:
+            order = np.argsort(-covis_num)
+        else:
+            order = np.argpartition(covis_num, -num_matched)[-num_matched:]
+            order = order[np.argsort(-covis_num[order])]
+        pairs.extend(
+            (image_names[image_id], image_names[int(covis_ids[i])]) for i in order
+        )
+
+    logger.info("Found %d pairs.", len(pairs))
+    with open(output, "w") as f:
+        f.write("\n".join(" ".join(pair) for pair in pairs))
+    # Drop the C++ reconstruction before any later pycolmap model is loaded.
+    del covis_by_image, reconstruction
+    return
+
+
 def main(model, output, num_matched):
+    # 大型 map 优先使用 pycolmap 的 C++ 重建对象，避免 legacy reader
+    # 为每个 3D 点创建大量 Python 对象。失败时保留下方旧实现兼容性。
+    try:
+        return _main_pycolmap(model, output, num_matched)
+    except Exception as exc:
+        logger.warning("Memory-efficient covisibility pass failed (%s); using legacy reader.", exc)
     logger.info("Reading the COLMAP model...")
     # 读取 COLMAP 的稀疏重建模型（cameras, images, points3D）
     # model: 包含 cameras.bin, images.bin, points3D.bin 的文件夹路径

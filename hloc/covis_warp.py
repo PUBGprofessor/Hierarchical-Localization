@@ -27,6 +27,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 from PIL import Image as PILImage, ImageDraw
+from collections import namedtuple
 
 ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
@@ -134,8 +135,8 @@ def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, mar
     没有几何支持，不应送入 LightGlue 或 PnP。
     """
     map_model = Path(map_model).resolve()
-    images, points, cameras = _read_model_cached(str(map_model))
-    map_image = next((im for im in images.values() if im.name == map_name), None)
+    images, point_ids, point_xyz, cameras = _read_model_cached(str(map_model))
+    map_image = images.get(map_name)
     if map_image is None:
         raise ValueError(f"Map image {map_name} not found in {map_model}")
     map_camera = cameras[map_image.camera_id]
@@ -144,7 +145,15 @@ def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, mar
     # map_image.point3D_ids 是 COLMAP 的 2D 观测到 3D 点 ID 的关联表。
     # -1 表示该像素没有有效 3D 点，因此先排除。
     ids = np.unique(map_image.point3D_ids[map_image.point3D_ids >= 0])
-    xyz = np.asarray([points[int(pid)].xyz for pid in ids], dtype=float)
+    if not len(point_ids):
+        return None
+    # 点 ID 通常不是连续整数，使用排序后的紧凑数组二分查找坐标，避免
+    # 为每个 3D 点创建 Python dict/namedtuple。
+    point_indices = np.searchsorted(point_ids, ids)
+    safe_indices = np.minimum(point_indices, max(len(point_ids) - 1, 0))
+    valid = (point_indices < len(point_ids)) & (point_ids[safe_indices] == ids)
+    ids = ids[valid]
+    xyz = point_xyz[point_indices[valid]]
     quv, qz = project(xyz, qR, qt, query_camera)
     # query 视锥判定：深度必须为正，且投影点必须落在 query 图像边界内。
     keep = (qz > 0) & (quv[:, 0] >= 0) & (quv[:, 0] < query_camera.width) & (quv[:, 1] >= 0) & (quv[:, 1] < query_camera.height)
@@ -170,11 +179,79 @@ def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, mar
 
 @lru_cache(maxsize=2)
 def _read_model_cached(model_path):
-    """缓存 map 文本 SfM 模型，避免每个 query/map 对重复解析大文件。"""
+    """缓存紧凑 map 索引，避免 read_points3D_text 的巨大 Python 对象开销。
+
+    返回：
+      - ``images``：按图像名索引的轻量元数据，只保留位姿、相机 ID 和
+        3D 点 ID，不保留 COLMAP 2D 坐标；
+      - ``point_ids`` / ``point_xyz``：排序后的 NumPy 数组；
+      - ``cameras``：少量相机内参。
+    """
     model_path = Path(model_path)
-    return (read_images_text(model_path / "images.txt"),
-            read_points3D_text(model_path / "points3D.txt"),
-            read_cameras_text(model_path / "cameras.txt"))
+    image_record = namedtuple("CompactImage", "qvec tvec camera_id point3D_ids")
+    images = {}
+    with (model_path / "images.txt").open("r", encoding="utf-8") as handle:
+        while True:
+            line = handle.readline()
+            if not line:
+                break
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            fields = line.split()
+            name = fields[9]
+            observations = handle.readline()
+            if observations is None:
+                raise ValueError(f"Missing observations for map image {name}")
+            values = np.fromstring(observations, sep=" ", dtype=np.float64)
+            images[name] = image_record(
+                qvec=np.asarray(fields[1:5], dtype=np.float64),
+                tvec=np.asarray(fields[5:8], dtype=np.float64),
+                camera_id=int(fields[8]),
+                point3D_ids=values[2::3].astype(np.int64, copy=False),
+            )
+
+    point_count = None
+    point_ids = None
+    point_xyz = None
+    point_index = 0
+    with (model_path / "points3D.txt").open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                if "Number of points:" in stripped:
+                    point_count = int(stripped.rsplit(":", 1)[1].strip())
+                    point_ids = np.empty(point_count, dtype=np.int64)
+                    point_xyz = np.empty((point_count, 3), dtype=np.float32)
+                continue
+            values = np.fromstring(stripped, sep=" ", dtype=np.float64)
+            if values.size >= 4:
+                if point_ids is None:
+                    # 非标准文件没有数量头时才使用列表回退；正常 COLMAP
+                    # 文本模型会进入上面的预分配路径。
+                    point_ids = []
+                    point_xyz = []
+                if isinstance(point_ids, list):
+                    point_ids.append(int(values[0]))
+                    point_xyz.append(values[1:4].astype(np.float32, copy=False))
+                elif point_index < len(point_ids):
+                    point_ids[point_index] = int(values[0])
+                    point_xyz[point_index] = values[1:4]
+                point_index += 1
+    if isinstance(point_ids, list):
+        point_ids = np.asarray(point_ids, dtype=np.int64)
+        point_xyz = np.asarray(point_xyz, dtype=np.float32)
+    else:
+        point_ids = point_ids[:point_index]
+        point_xyz = point_xyz[:point_index]
+    order = np.argsort(point_ids)
+    return images, point_ids[order], point_xyz[order], read_cameras_text(model_path / "cameras.txt")
+
+
+def clear_model_cache():
+    """释放紧凑 SfM 索引；应在 localize_sfm 加载 pycolmap 前调用。"""
+    _read_model_cached.cache_clear()
 
 
 def process_pair(args, query_name, map_name, output_dir, model_data, query_camera):
