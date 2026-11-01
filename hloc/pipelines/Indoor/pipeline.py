@@ -49,11 +49,18 @@ def model_images(model):
 
 
 def prepare_queries(model, image_dir, output):
-    """Build HLoc's query list from image files and intrinsics, not GT poses."""
+    """Build HLoc's query list with per-image intrinsics, not GT poses.
+
+    COLMAP may assign a different camera model to every query image.  The
+    image-to-camera association is read from images.txt, while the camera
+    parameters themselves come from cameras.txt.  The stored qvec/tvec are
+    deliberately ignored here and are only used later by evaluate().
+    """
     cameras = read_cameras_text(model / "cameras.txt")
-    if len(cameras) != 1:
-        raise ValueError("Query cameras.txt must contain one shared camera")
-    camera = next(iter(cameras.values()))
+    query_model_images = read_images_text(model / "images.txt")
+    name_to_camera = {
+        image.name: cameras[image.camera_id] for image in query_model_images.values()
+    }
     suffixes = {".jpg", ".jpeg", ".png"}
     names = sorted(
         path.relative_to(image_dir).as_posix()
@@ -64,6 +71,12 @@ def prepare_queries(model, image_dir, output):
         raise ValueError(f"No query images in {image_dir}")
     lines = []
     for name in names:
+        if name not in name_to_camera:
+            raise ValueError(
+                f"Image {name} is missing from COLMAP query images.txt; "
+                "cannot determine its camera intrinsics."
+            )
+        camera = name_to_camera[name]
         lines.append(
             f"{name} {camera.model} {camera.width} {camera.height} "
             + " ".join(map(str, camera.params))
@@ -236,7 +249,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--map-dir", type=Path, default=dataset_path("Indoor_map_51"))
     parser.add_argument("--query-dir", type=Path, default=dataset_path("Indoor_query_38_38"))
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Indoor127_megaloc")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "output" / "Aachen_Hloc")
     parser.add_argument("--num-covis", type=int, default=20)
     parser.add_argument("--num-loc", type=int, default=10)
     arguments = parser.parse_args()
