@@ -41,11 +41,21 @@ def parse_pose(path, name):
     文件行格式为 ``name qw qx qy qz tx ty tz``。四元数描述旋转
     ``R``，平移向量为 ``t``，满足 ``X_camera = R X_world + t``。
     """
+    exact = None
+    basename_matches = []
     for line in path.read_text(encoding="utf-8").splitlines():
         row = line.split()
-        if row and row[0] == name:
-            vals = np.asarray([float(v) for v in row[1:8]])
-            return qvec2rotmat(vals[:4]), vals[4:]
+        if not row or row[0].startswith("#"):
+            continue
+        if row[0] == name:
+            exact = row
+            break
+        if Path(row[0]).name == Path(name).name:
+            basename_matches.append(row)
+    row = exact if exact is not None else (basename_matches[0] if len(basename_matches) == 1 else None)
+    if row is not None:
+        vals = np.asarray([float(v) for v in row[1:8]])
+        return qvec2rotmat(vals[:4]), vals[4:]
     raise ValueError(f"Pose for {name!r} not found in {path}")
 
 
@@ -121,9 +131,10 @@ def load_descriptors(path):
     MegaLoc 特征文件的每个 HDF5 group 包含 ``global_descriptor``；这里
     只用于批处理入口的 top-k 检索，主定位流程复用已经生成的配对文件。
     """
+    from hloc.utils.io import list_h5_names
     with h5py.File(path, "r") as f:
         return {name: np.asarray(f[name]["global_descriptor"], dtype=np.float32)
-                for name in sorted(f.keys())}
+                for name in sorted(list_h5_names(path))}
 
 
 def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=50):

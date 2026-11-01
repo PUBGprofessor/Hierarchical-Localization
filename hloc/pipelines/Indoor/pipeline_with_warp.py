@@ -169,9 +169,28 @@ def h5_contains_images(path, image_names):
         return False
     try:
         with h5py.File(path, "r") as handle:
+            # HDF5 group 可能是 db/1003.jpg；不能用 name in handle 判断
+            # 根层，因为根层只包含 db。逐级访问才支持带前缀的图像名。
             return all(name in handle for name in image_names)
     except (OSError, ValueError):
         return False
+
+
+def lookup_by_image_name(table, name):
+    """按完整名查找位姿/日志，必要时唯一地回退到 basename。
+
+    HLoc 的 ``write_poses`` 会把 ``db/1003.jpg`` 写成 ``1003.jpg``，而
+    Aachen 的 query H5、images.txt 和 reloc3r 文件保留了 ``db/`` 前缀。
+    先精确匹配，再在 basename 唯一时回退，兼容两种格式并避免同名歧义。
+    返回 ``(匹配键, 值)``，找不到时返回 ``(None, None)``。
+    """
+    if name in table:
+        return name, table[name]
+    basename = Path(name).name
+    candidates = [(key, value) for key, value in table.items() if Path(key).name == basename]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None, None
 
 
 def read_pose_table(path):
@@ -236,12 +255,20 @@ def apply_estimated_pose_fallback(
         "queries": {},
     }
     for name, pose in predicted.items():
-        if name not in estimated:
-            report["queries"][name] = {"status": "no_estimated_pose"}
+        estimated_name, estimated_pose = lookup_by_image_name(estimated, name)
+        if estimated_pose is None:
+            report["queries"][name] = {
+                "status": "no_estimated_pose",
+                "estimated_pose_lookup": "exact_or_unique_basename_failed",
+            }
             continue
-        error = rotation_error_deg(pose[:4], estimated[name][:4])
+        # localize_sfm 的日志键可能保留 db/ 前缀，也可能和输出位姿一样
+        # 只有 basename；对两种键使用相同的兼容查找。
+        _, localization_log = lookup_by_image_name(localization_logs, name)
+        localization_log = localization_log or {}
+        error = rotation_error_deg(pose[:4], estimated_pose[:4])
         # PnP_ret 缺失正是 localize_sfm 使用 top1 位姿兜底的标志。
-        pnp_failed = localization_logs.get(name, {}).get("PnP_ret") is None
+        pnp_failed = localization_log.get("PnP_ret") is None
         rotation_exceeded = error > threshold_deg
         use_estimated = pnp_failed or rotation_exceeded
         triggers = []
@@ -251,12 +278,15 @@ def apply_estimated_pose_fallback(
             triggers.append("rotation_error_exceeded")
         report["queries"][name] = {
             "rotation_error_deg": error,
+            "estimated_pose_key": estimated_name,
             "pnp_failed": pnp_failed,
             "triggers": triggers,
             "status": "estimated_pose_fallback" if use_estimated else "hloc",
         }
         if use_estimated:
-            predicted[name] = estimated[name]
+            # 写出时保留 HLoc 当前使用的图像键（通常是 basename），只
+            # 替换 7 个位姿数值；estimated_pose 可能来自 db/ 前缀键。
+            predicted[name] = estimated_pose
             fallback_names.add(name)
 
     # 按原 HLoc 图像顺序重写最终文件，只替换位姿数值，不改图像名。
@@ -309,9 +339,13 @@ def evaluate(results, query_model, query_names, output, fallback_names=None):
         translation = rotation = None
         if prediction is not None:
             method = (
-                "estimated_pose_fallback" if name in fallback_names
-                else ("pnp" if logs.get(name, {}).get("PnP_ret") is not None
-                      else "retrieval_fallback")
+                "estimated_pose_fallback"
+                if (name in fallback_names or Path(name).name in fallback_names)
+                else (
+                    "pnp"
+                    if (lookup_by_image_name(logs, name)[1] or {}).get("PnP_ret") is not None
+                    else "retrieval_fallback"
+                )
             )
             gt_rotation = image.qvec2rotmat()
             predicted_rotation = qvec2rotmat(prediction[:4])
