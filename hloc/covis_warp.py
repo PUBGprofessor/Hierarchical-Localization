@@ -101,18 +101,32 @@ def hull_mask(points, width, height, margin):
         cv2 = None
 
     pts = np.unique(np.round(points).astype(int), axis=0)
-    if len(pts) < 3:
-        raise ValueError("Fewer than three valid projected points; cannot form region")
+    if len(pts) == 0:
+        raise ValueError("No projected points; cannot form a region")
     if cv2 is not None:
-        # cv2.convexHull 返回凸包顶点；fillConvexPoly 将其变成像素掩膜。
-        hull = cv2.convexHull(pts.astype(np.int32)).reshape(-1, 1, 2)
         base = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillConvexPoly(base, hull, 255)
+        if len(pts) == 1:
+            # 单点的凸包退化为点；后续膨胀会生成以该投影为中心的局部圆盘。
+            cv2.circle(base, tuple(pts[0]), 1, 255, thickness=-1)
+        elif len(pts) == 2:
+            # 两点的凸包退化为线段；外扩后形成胶囊形共视区域。
+            cv2.line(base, tuple(pts[0]), tuple(pts[1]), 255, thickness=1)
+        else:
+            # 三点及以上使用标准二维凸包。
+            hull = cv2.convexHull(pts.astype(np.int32)).reshape(-1, 1, 2)
+            cv2.fillConvexPoly(base, hull, 255)
     else:
-        from scipy.spatial import ConvexHull
-        hull = pts[ConvexHull(pts).vertices]
         base_image = PILImage.new("L", (width, height), 0)
-        ImageDraw.Draw(base_image).polygon([tuple(p) for p in hull], fill=255)
+        draw = ImageDraw.Draw(base_image)
+        if len(pts) == 1:
+            x, y = pts[0]
+            draw.point((x, y), fill=255)
+        elif len(pts) == 2:
+            draw.line([tuple(pts[0]), tuple(pts[1])], fill=255, width=1)
+        else:
+            from scipy.spatial import ConvexHull
+            hull = pts[ConvexHull(pts).vertices]
+            draw.polygon([tuple(p) for p in hull], fill=255)
         base = np.asarray(base_image)
     if margin:
         # 膨胀是对位姿误差、重建误差和稀疏采样误差的宽松补偿。
@@ -137,13 +151,15 @@ def load_descriptors(path):
                 for name in sorted(list_h5_names(path))}
 
 
-def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=50):
-    """计算一个 query/map 对的共视掩膜。
+def compute_pair_geometry(query_name, map_name, poses, map_model, query_camera, margin=50):
+    """统一计算 query/map 对的共享 3D 点、投影坐标和共视掩膜。
 
     ``query_camera`` 只提供 query 内参；query 外参始终从 ``poses`` 读取。
-    返回 ``(query_mask, map_mask)``，或者在没有任何共享 3D 点时返回
-    ``None``。返回 ``None`` 是重要的语义：该候选 map 图像与 query
-    没有几何支持，不应送入 LightGlue 或 PnP。
+    若没有共享 3D 点则返回 ``None``。否则返回字典，包含：
+    ``point3D_ids``、``xyz``、``query_xy``、``map_xy``、``query_mask``、
+    ``map_mask`` 和 map 图像关联点总数。一个共享点生成圆盘，两个点生成
+    胶囊形区域，三个及以上构造凸包。pipeline 和离线 warp 均调用本函数，
+    从而确保视锥筛选、投影、凸包和外扩规则一致。
     """
     map_model = Path(map_model).resolve()
     images, point_ids, point_xyz, cameras = _read_model_cached(str(map_model))
@@ -156,6 +172,7 @@ def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, mar
     # map_image.point3D_ids 是 COLMAP 的 2D 观测到 3D 点 ID 的关联表。
     # -1 表示该像素没有有效 3D 点，因此先排除。
     ids = np.unique(map_image.point3D_ids[map_image.point3D_ids >= 0])
+    map_point_count = len(ids)
     if not len(point_ids):
         return None
     # 点 ID 通常不是连续整数，使用排序后的紧凑数组二分查找坐标，避免
@@ -168,24 +185,47 @@ def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, mar
     quv, qz = project(xyz, qR, qt, query_camera)
     # query 视锥判定：深度必须为正，且投影点必须落在 query 图像边界内。
     keep = (qz > 0) & (quv[:, 0] >= 0) & (quv[:, 0] < query_camera.width) & (quv[:, 1] >= 0) & (quv[:, 1] < query_camera.height)
-    xyz, quv = xyz[keep], quv[keep]
+    ids, xyz, quv = ids[keep], xyz[keep], quv[keep]
     muv, mz = project(xyz, mR, map_image.tvec, map_camera)
     keep = (mz > 0) & (muv[:, 0] >= 0) & (muv[:, 0] < map_camera.width) & (muv[:, 1] >= 0) & (muv[:, 1] < map_camera.height)
-    quv, muv = quv[keep], muv[keep]
+    ids, xyz, quv, muv = ids[keep], xyz[keep], quv[keep], muv[keep]
     # 0 个共享点表示该候选图与 query 没有几何共视支持，调用方应直接
     # 删除该候选，而不是用全图掩膜把无关图像送入 PnP。
     if len(quv) == 0:
         return None
-    # 1~2 个点不能稳定构造凸包。此时保留候选，但采用全图掩膜，让
-    # LightGlue 按原始 HLoc 方式尝试匹配；只有真正的 0 点才会被过滤。
-    if len(quv) < 3:
-        return np.ones((query_camera.height, query_camera.width), bool), np.ones((map_camera.height, map_camera.width), bool)
+    # 单点/两点的退化凸包由 hull_mask 生成局部圆盘/胶囊区域，不能用全图
+    # 掩膜替代，否则共视裁剪失效。掩膜生成失败时明确报错而不是静默放宽。
     try:
         qmask = hull_mask(quv, query_camera.width, query_camera.height, margin)
         mmask = hull_mask(muv, map_camera.width, map_camera.height, margin)
-    except Exception:
-        return np.ones((query_camera.height, query_camera.width), bool), np.ones((map_camera.height, map_camera.width), bool)
-    return qmask, mmask
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not build covisibility masks for {query_name} and {map_name} "
+            f"from {len(quv)} shared points"
+        ) from exc
+    return {
+        "point3D_ids": ids,
+        "xyz": xyz,
+        "query_xy": quv,
+        "map_xy": muv,
+        "query_mask": qmask,
+        "map_mask": mmask,
+        "points_in_map_image": map_point_count,
+    }
+
+
+def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=50):
+    """计算共视掩膜的兼容接口，零共享点时返回 None。
+
+    主定位 pipeline 只需要掩膜，因此保留这个轻量接口；实际几何步骤由
+    ``compute_pair_geometry`` 统一实现。
+    """
+    geometry = compute_pair_geometry(
+        query_name, map_name, poses, map_model, query_camera, margin
+    )
+    if geometry is None:
+        return None
+    return geometry["query_mask"], geometry["map_mask"]
 
 
 @lru_cache(maxsize=2)
@@ -290,8 +330,8 @@ def process_pair(args, query_name, map_name, output_dir, model_data, query_camer
     output_dir.mkdir(parents=True, exist_ok=True)
     record = {"query": query_name, "map": map_name, "points_in_map_image": int(len(np.unique(map_image.point3D_ids[map_image.point3D_ids >= 0]))),
               "shared_frustum_points": int(len(ids)), "margin_px": args.margin}
-    if len(ids) >= 3:
-        # 只有至少三个非共线点时，凸包才有稳定的二维面积。
+    if len(ids) >= 1:
+        # 退化点集也由 hull_mask 生成局部圆盘或胶囊形区域。
         qmask = hull_mask(quv, query_camera.width, query_camera.height, args.margin)
         mmask = hull_mask(muv, map_cam.width, map_cam.height, args.margin)
         np.savez_compressed(output_dir / f"{Path(query_name).stem}_{Path(map_name).stem}_points.npz",
@@ -306,7 +346,7 @@ def process_pair(args, query_name, map_name, output_dir, model_data, query_camer
             PILImage.fromarray(out).save(output_dir / f"{label}_{name}")
         record.update(query_mask_pixels=int(qmask.sum()), map_mask_pixels=int(mmask.sum()))
     else:
-        record["warning"] = "Fewer than three shared points; projections saved without hull mask"
+        record["warning"] = "No shared 3D points; no covisibility mask was generated"
         np.savez_compressed(output_dir / f"{Path(query_name).stem}_{Path(map_name).stem}_points.npz",
                             point3D_ids=ids, xyz=xyz, query_xy=quv, map_xy=muv)
     (output_dir / f"{Path(map_name).stem}_metadata.json").write_text(json.dumps(record, indent=2), encoding="utf-8")

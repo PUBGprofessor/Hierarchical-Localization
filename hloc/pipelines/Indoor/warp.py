@@ -32,7 +32,8 @@ from PIL import Image as PILImage, ImageDraw
 ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT))
-from hloc.utils.read_write_model import qvec2rotmat, read_cameras_text, read_images_text, read_points3D_text
+from hloc import covis_warp
+from hloc.utils.read_write_model import read_cameras_text, read_images_text, read_points3D_text
 
 
 def parse_pose(path, name):
@@ -154,44 +155,64 @@ def load_descriptors(path):
     return descriptors
 
 
-def process_pair(args, query_name, map_name, output_dir, model_data, query_camera):
+def process_pair(args, query_name, map_name, output_dir, query_cameras):
     """处理单个 query/map 对，保存共视点投影和两张黑底掩膜图。
 
-    ``model_data`` 是 map COLMAP 的 images、points3D、cameras 字典；
-    ``query_camera`` 只提供 query 内参，query 外参由 ``args.poses`` 读取。
+    ``query_cameras`` 是按 query 图像名索引的相机内参。全部共视几何
+    均由 ``hloc.covis_warp`` 计算，本函数只负责保存可视化和中间文件。
     返回的 record 用于写入该 map 候选的 JSON 元数据。
     """
-    images, points, cameras = model_data
-    map_image = next((im for im in images.values() if im.name == map_name), None)
-    if map_image is None:
-        raise ValueError(f"Map image {map_name} missing from map COLMAP model")
-    map_cam = cameras[map_image.camera_id]
-    # query 外参使用 reloc3r 估计值；map 外参使用 map SfM 注册位姿。
-    qR, qt = parse_pose(args.poses, query_name)
-    mR = qvec2rotmat(map_image.qvec)
-    # map_image.point3D_ids 与该图像的 2D 特征观测一一对应；-1 表示该
-    # 特征没有三角化关联。只保留有效 ID，并对重复 ID 去重。
-    ids = np.unique(map_image.point3D_ids[map_image.point3D_ids >= 0])
-    xyz = np.asarray([points[int(pid)].xyz for pid in ids], dtype=float)
-
-    # 第一阶段：把 map 图像中的 3D 点投到 query，做 query 视锥筛选。
-    quv, qz = project(xyz, qR, qt, query_camera)
-    inside = (qz > 0) & (quv[:, 0] >= 0) & (quv[:, 0] < query_camera.width) & (quv[:, 1] >= 0) & (quv[:, 1] < query_camera.height)
-    ids, xyz, quv = ids[inside], xyz[inside], quv[inside]
-
-    # 第二阶段：把已进入 query 视锥的点再投回 map 图像，排除 map 相机
-    # 后方或 map 图像边界以外的点。剩余点才是本对图像共同有效的 3D 点。
-    muv, mz = project(xyz, mR, map_image.tvec, map_cam)
-    inside_map = (mz > 0) & (muv[:, 0] >= 0) & (muv[:, 0] < map_cam.width) & (muv[:, 1] >= 0) & (muv[:, 1] < map_cam.height)
-    ids, xyz, quv, muv = ids[inside_map], xyz[inside_map], quv[inside_map], muv[inside_map]
+    # Aachen 等数据集可能混有横图、竖图或不同相机。必须按该 query 在
+    # COLMAP images.txt 中的 camera_id 取内参，不能把第一台相机套给所有图。
+    query_camera = query_cameras[query_name]
+    # pipeline_with_warp 使用的共视工具统一负责点筛选、两相机投影、凸包
+    # 和像素外扩。warp.py 这里只消费几何结果并负责保存可视化产物。
+    geometry = covis_warp.compute_pair_geometry(
+        query_name,
+        map_name,
+        args.poses,
+        args.map_root / "sparse/0",
+        query_camera,
+        margin=args.margin,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
-    record = {"query": query_name, "map": map_name, "points_in_map_image": int(len(np.unique(map_image.point3D_ids[map_image.point3D_ids >= 0]))),
-              "shared_frustum_points": int(len(ids)), "margin_px": args.margin}
-    if len(ids) >= 3:
-        # 在两幅图各自的像素坐标中独立生成凸包掩膜。两个掩膜形状可能
-        # 因两相机图像尺寸不同而不同，但代表同一组 3D 点的投影区域。
-        qmask = hull_mask(quv, query_camera.width, query_camera.height, args.margin)
-        mmask = hull_mask(muv, map_cam.width, map_cam.height, args.margin)
+    if geometry is None:
+        # 和定位 pipeline 一致：0 个共享 3D 点意味着没有几何共视依据。
+        record = {
+            "query": query_name,
+            "map": map_name,
+            "points_in_map_image": 0,
+            "shared_frustum_points": 0,
+            "margin_px": args.margin,
+            "warning": "No shared 3D points; candidate has no geometric covisibility",
+        }
+        np.savez_compressed(
+            output_dir / f"{Path(query_name).stem}_{Path(map_name).stem}_points.npz",
+            point3D_ids=np.empty(0, dtype=np.int64),
+            xyz=np.empty((0, 3), dtype=np.float32),
+            query_xy=np.empty((0, 2), dtype=np.float64),
+            map_xy=np.empty((0, 2), dtype=np.float64),
+        )
+        (output_dir / f"{Path(map_name).stem}_metadata.json").write_text(
+            json.dumps(record, indent=2), encoding="utf-8")
+        return record
+
+    ids = geometry["point3D_ids"]
+    xyz = geometry["xyz"]
+    quv = geometry["query_xy"]
+    muv = geometry["map_xy"]
+    qmask = geometry["query_mask"]
+    mmask = geometry["map_mask"]
+    record = {
+        "query": query_name,
+        "map": map_name,
+        "points_in_map_image": int(geometry["points_in_map_image"]),
+        "shared_frustum_points": int(len(ids)),
+        "margin_px": args.margin,
+    }
+    # 单点/两点时 helper 返回圆盘/胶囊掩膜，仍生成 PNG，使离线可视化
+    # 与 pipeline 实际送给 LightGlue 的裁剪区域完全一致。
+    if len(ids) >= 1:
         # NPZ 保存共享 3D 点 ID、世界坐标及其 query/map 像素投影，便于
         # 后续检查几何筛选结果，不保存图像特征描述子。
         np.savez_compressed(output_dir / f"{Path(query_name).stem}_{Path(map_name).stem}_points.npz",
@@ -209,12 +230,6 @@ def process_pair(args, query_name, map_name, output_dir, model_data, query_camer
             output_name = f"{label}_{Path(name).name}"
             PILImage.fromarray(out).save(output_dir / output_name)
         record.update(query_mask_pixels=int(qmask.sum()), map_mask_pixels=int(mmask.sum()))
-    else:
-        # 点数不足时仍保存空/少量点投影和 warning，但不输出掩膜 PNG，
-        # 因为无法得到稳定的二维凸包区域。
-        record["warning"] = "Fewer than three shared points; projections saved without hull mask"
-        np.savez_compressed(output_dir / f"{Path(query_name).stem}_{Path(map_name).stem}_points.npz",
-                            point3D_ids=ids, xyz=xyz, query_xy=quv, map_xy=muv)
     (output_dir / f"{Path(map_name).stem}_metadata.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record
 
@@ -235,14 +250,17 @@ def main():
     ap.add_argument("--output", type=Path, default=ROOT / "output/Indoor_127_covis")
     args = ap.parse_args()
 
-    model = args.map_root / "sparse/0"
-    # COLMAP 文本模型：images 提供 map 位姿及 2D-3D 关联，points3D 提供
-    # 世界坐标，cameras 提供 map 相机内参。
-    model_data = (read_images_text(model / "images.txt"), read_points3D_text(model / "points3D.txt"), read_cameras_text(model / "cameras.txt"))
     # 此处只使用 query 相机内参。不要从 query sparse/0/images.txt 取外参，
     # 因为其中可能是真值位姿，不能用于本流程的共视估计。
-    # query cameras.txt 只取内参；query 真值外参完全不用。
-    query_camera = next(iter(read_cameras_text((args.query_root / "sparse/0/cameras.txt")).values()))
+    # query images.txt 这里只用图像名和 camera_id 选择内参；其中的 qvec/tvec
+    # 真值外参不参与计算，query 位姿仍只从 --poses 指定的估计文件读取。
+    query_model = args.query_root / "sparse/0"
+    query_camera_models = read_cameras_text(query_model / "cameras.txt")
+    query_images = read_images_text(query_model / "images.txt")
+    query_cameras = {
+        image.name: query_camera_models[image.camera_id]
+        for image in query_images.values()
+    }
     # query 外参明确来自 --poses 指定的 reloc3r 估计位姿文件，格式遵循
     # COLMAP w2c 约定；默认文件为 reloc3r_Indoor127_megaloc/query_poses.txt。
     map_feats = load_descriptors(args.map_root / "hloc_outputs/global-feats-megaloc.h5")
@@ -271,7 +289,7 @@ def main():
             # 每个 query-map 对单独建目录，确保两个掩膜图和点投影一一对应，
             # 不会因多个 map 候选共用 query 名而相互覆盖。
             pair_dir = qdir / f"rank{rank:02d}_{Path(map_name).stem}"
-            record = process_pair(args, query_name, map_name, pair_dir, model_data, query_camera)
+            record = process_pair(args, query_name, map_name, pair_dir, query_cameras)
             record.update(rank=rank, cosine_similarity=score)
             # 单对 JSON 保存共视点数、掩膜面积、top-k 排名和检索分数。
             (pair_dir / f"{Path(map_name).stem}_metadata.json").write_text(
