@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT))
 from hloc import covis_warp
-from hloc.utils.read_write_model import read_cameras_text, read_images_text, read_points3D_text
+from hloc.utils.read_write_model import qvec2rotmat, read_cameras_text, read_images_text, read_points3D_text
 
 
 def parse_pose(path, name):

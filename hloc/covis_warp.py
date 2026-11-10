@@ -32,7 +32,15 @@ from collections import namedtuple
 ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT))
+from hloc import logger
 from hloc.utils.read_write_model import qvec2rotmat, read_cameras_text, read_images_text, read_points3D_text
+
+
+class PoseNotFoundError(ValueError):
+    """估计位姿文件存在、但其中没有指定图像的位姿记录。"""
+
+
+_WARNED_MISSING_POSES = set()
 
 
 def parse_pose(path, name):
@@ -56,7 +64,7 @@ def parse_pose(path, name):
     if row is not None:
         vals = np.asarray([float(v) for v in row[1:8]])
         return qvec2rotmat(vals[:4]), vals[4:]
-    raise ValueError(f"Pose for {name!r} not found in {path}")
+    raise PoseNotFoundError(f"Pose for {name!r} not found in {path}")
 
 
 def project(xyz, rotation, translation, camera):
@@ -215,14 +223,37 @@ def compute_pair_geometry(query_name, map_name, poses, map_model, query_camera, 
 
 
 def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=50):
-    """计算共视掩膜的兼容接口，零共享点时返回 None。
+    """计算共视掩膜；无估计位姿时返回全图掩膜以跳过该对的共视裁剪。
 
     主定位 pipeline 只需要掩膜，因此保留这个轻量接口；实际几何步骤由
-    ``compute_pair_geometry`` 统一实现。
+    ``compute_pair_geometry`` 统一实现。零共享点仍返回 ``None``，使无关
+    候选被过滤；但缺少 query 估计位姿时无法判断共视关系，此时只记录一次
+    警告并返回全图掩膜。这样候选会保留，匹配器使用全图关键点继续 HLoc。
     """
-    geometry = compute_pair_geometry(
-        query_name, map_name, poses, map_model, query_camera, margin
-    )
+    try:
+        geometry = compute_pair_geometry(
+            query_name, map_name, poses, map_model, query_camera, margin
+        )
+    except PoseNotFoundError:
+        # 一个 query 往往对应多个检索候选；日志按 query 去重，避免同一
+        # 张图片的 top-k 候选重复刷屏。此分支仅放宽裁剪，不改变匹配/PnP流程。
+        if query_name not in _WARNED_MISSING_POSES:
+            logger.warning(
+                "Estimated pose missing for query %r in %s; skipping covisibility "
+                "cropping for its pairs and using full-image features in HLoc.",
+                query_name,
+                poses,
+            )
+            _WARNED_MISSING_POSES.add(query_name)
+        images, _, _, cameras = _read_model_cached(str(Path(map_model).resolve()))
+        map_image = images.get(map_name)
+        if map_image is None:
+            raise ValueError(f"Map image {map_name} not found in {map_model}")
+        map_camera = cameras[map_image.camera_id]
+        return (
+            np.ones((query_camera.height, query_camera.width), dtype=bool),
+            np.ones((map_camera.height, map_camera.width), dtype=bool),
+        )
     if geometry is None:
         return None
     return geometry["query_mask"], geometry["map_mask"]
