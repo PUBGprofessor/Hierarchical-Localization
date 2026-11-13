@@ -85,13 +85,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=Path,
-        default="datasets/aachen",
+        default=Path(r"D:\Datasets\Aachen-Day-Night\dataset"),
         help="Path to the dataset, default: %(default)s",
     )
     parser.add_argument(
         "--outputs",
         type=Path,
-        default="outputs/aachen",
+        default=Path("outputs/aachen"),
         help="Path to the output directory, default: %(default)s",
     )
     parser.add_argument(

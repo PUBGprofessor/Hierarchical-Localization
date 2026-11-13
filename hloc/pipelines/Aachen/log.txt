@@ -1,0 +1,113 @@
+(dl) PS D:\project\Hierarchical-Localization> python -m hloc.pipelines.Aachen.pipeline
+[2026/11/13 13:01:31 hloc INFO] Configs for feature extractors:
+{'aliked-n16': {'model': {'model_name': 'aliked-n16', 'name': 'aliked'},
+                'output': 'feats-aliked-n16',
+                'preprocessing': {'grayscale': False, 'resize_max': 1024}},
+ 'd2net-ss': {'model': {'multiscale': False, 'name': 'd2net'},
+              'output': 'feats-d2net-ss',
+              'preprocessing': {'grayscale': False, 'resize_max': 1600}},
+ 'dir': {'model': {'name': 'dir'},
+         'output': 'global-feats-dir',
+         'preprocessing': {'resize_max': 1024}},
+ 'disk': {'model': {'max_keypoints': 5000, 'name': 'disk'},
+          'output': 'feats-disk',
+          'preprocessing': {'grayscale': False, 'resize_max': 1600}},
+ 'megaloc': {'model': {'name': 'megaloc'},
+             'output': 'global-feats-megaloc',
+             'preprocessing': {'resize_max': 1024}},
+ 'netvlad': {'model': {'name': 'netvlad'},
+             'output': 'global-feats-netvlad',
+             'preprocessing': {'resize_max': 1024}},
+ 'openibl': {'model': {'name': 'openibl'},
+             'output': 'global-feats-openibl',
+             'preprocessing': {'resize_max': 1024}},
+ 'r2d2': {'model': {'max_keypoints': 5000, 'name': 'r2d2'},
+          'output': 'feats-r2d2-n5000-r1024',
+          'preprocessing': {'grayscale': False, 'resize_max': 1024}},
+ 'sift': {'model': {'name': 'dog'},
+          'output': 'feats-sift',
+          'preprocessing': {'grayscale': True, 'resize_max': 1600}},
+ 'sosnet': {'model': {'descriptor': 'sosnet', 'name': 'dog'},
+            'output': 'feats-sosnet',
+            'preprocessing': {'grayscale': True, 'resize_max': 1600}},
+ 'superpoint_aachen': {'model': {'max_keypoints': 4096,
+                                 'name': 'superpoint',
+                                 'nms_radius': 3},
+                       'output': 'feats-superpoint-n4096-r1024',
+                       'preprocessing': {'grayscale': True,
+                                         'resize_max': 1024}},
+ 'superpoint_inloc': {'model': {'max_keypoints': 4096,
+                                'name': 'superpoint',
+                                'nms_radius': 4},
+                      'output': 'feats-superpoint-n4096-r1600',
+                      'preprocessing': {'grayscale': True, 'resize_max': 1600}},
+ 'superpoint_max': {'model': {'max_keypoints': 4096,
+                              'name': 'superpoint',
+                              'nms_radius': 3},
+                    'output': 'feats-superpoint-n4096-rmax1600',
+                    'preprocessing': {'grayscale': True,
+                                      'resize_force': True,
+                                      'resize_max': 1600}},
+ 'superpoint_my': {'model': {'max_keypoints': 2048,
+                             'name': 'superpoint',
+                             'nms_radius': 3},
+                   'output': 'feats-superpoint-n2048-rmax1024',
+                   'preprocessing': {'grayscale': True,
+                                     'resize_force': True,
+                                     'resize_max': 1024}}}
+[2026/11/13 13:01:31 hloc INFO] Configs for feature matchers:
+{'NN-mutual': {'model': {'do_mutual_check': True, 'name': 'nearest_neighbor'},
+               'output': 'matches-NN-mutual'},
+ 'NN-ratio': {'model': {'do_mutual_check': True,
+                        'name': 'nearest_neighbor',
+                        'ratio_threshold': 0.8},
+              'output': 'matches-NN-mutual-ratio.8'},
+ 'NN-superpoint': {'model': {'distance_threshold': 0.7,
+                             'do_mutual_check': True,
+                             'name': 'nearest_neighbor'},
+                   'output': 'matches-NN-mutual-dist.7'},
+ 'adalam': {'model': {'name': 'adalam'}, 'output': 'matches-adalam'},
+ 'aliked+lightglue': {'model': {'features': 'aliked', 'name': 'lightglue'},
+                      'output': 'matches-aliked-lightglue'},
+ 'disk+lightglue': {'model': {'features': 'disk', 'name': 'lightglue'},
+                    'output': 'matches-disk-lightglue'},
+ 'superglue': {'model': {'name': 'superglue',
+                         'sinkhorn_iterations': 50,
+                         'weights': 'outdoor'},
+               'output': 'matches-superglue'},
+ 'superglue-fast': {'model': {'name': 'superglue',
+                              'sinkhorn_iterations': 5,
+                              'weights': 'outdoor'},
+                    'output': 'matches-superglue-it5'},
+ 'superpoint+lightglue': {'model': {'features': 'superpoint',
+                                    'name': 'lightglue'},
+                          'output': 'matches-superpoint-lightglue'}}
+[2026/11/13 13:01:31 hloc INFO] Extracting local features with configuration:
+{'model': {'max_keypoints': 2048, 'name': 'superpoint', 'nms_radius': 3},
+ 'output': 'feats-superpoint-n2048-rmax1024',
+ 'preprocessing': {'grayscale': True, 'resize_force': True, 'resize_max': 1024}}
+[2026/11/13 13:01:32 hloc INFO] Found 5426 images in root D:\Datasets\Aachen-Day-Night\dataset\images_upright.
+Loaded SuperPoint model
+100%|████████████████████████████████████████████████████████████████████████████| 5426/5426 [04:15<00:00, 21.25it/s]
+[2026/11/13 13:05:47 hloc INFO] Finished exporting features.
+[2026/11/13 13:05:50 hloc INFO] Found 13026 images and 13026 cameras in database.
+[2026/11/13 13:05:50 hloc INFO] Reading the NVM model...
+[2026/11/13 13:05:50 hloc INFO] Reading 4328 cameras...
+[2026/11/13 13:05:50 hloc INFO] Reading 4328 images...
+[2026/11/13 13:05:50 hloc INFO] Reading 1652687 points...
+100%|██████████████████████████████████████████████████████████████████| 1652687/1652687 [00:33<00:00, 49971.53pts/s]
+[2026/11/13 13:06:23 hloc INFO] Parsing image data...
+[2026/11/13 13:06:41 hloc INFO] Writing the COLMAP model...
+[2026/11/13 13:08:00 hloc INFO] Done.
+[2026/11/13 13:08:01 hloc INFO] Reading the COLMAP model with pycolmap...
+[2026/11/13 13:08:09 hloc INFO] Extracting image pairs from covisibility info...
+100%|███████████████████████████████████████████████████████████████████| 1652687/1652687 [00:42<00:00, 38762.95it/s]
+100%|█████████████████████████████████████████████████████████████████████████| 4328/4328 [00:00<00:00, 25659.36it/s]
+[2026/11/13 13:08:52 hloc INFO] Found 85515 pairs.
+[2026/11/13 13:08:52 hloc INFO] Matching local features with configuration:
+{'model': {'features': 'superpoint', 'name': 'lightglue'},
+ 'output': 'matches-superpoint-lightglue'}
+D:\software\Anaconda\anaconda3\envs\dl\lib\site-packages\kornia\feature\lightglue.py:44: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+ 20%|██████████████▋                                                           | 11279/56731 [08:29<28:54, 26.20it/s]
+
