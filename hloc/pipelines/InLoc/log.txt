@@ -1,0 +1,16 @@
+(dl) PS D:\project\Hierarchical-Localization> python -m hloc.pipelines.InLoc.pipeline
+[2026/11/13 11:38:59 hloc INFO] Extracting local features with configuration:
+{'model': {'max_keypoints': 2048, 'name': 'superpoint', 'nms_radius': 3},
+ 'output': 'feats-superpoint-n2048-rmax1024',
+ 'preprocessing': {'grayscale': True, 'resize_force': True, 'resize_max': 1024}}
+[2026/11/13 11:39:01 hloc INFO] Found 15008 images in root D:\Datasets\InLoc.
+[2026/11/13 11:39:22 hloc INFO] Skipping the extraction.
+[2026/11/13 11:39:22 hloc INFO] Matching local features with configuration:
+{'model': {'features': 'superpoint', 'name': 'lightglue'},
+ 'output': 'matches-superpoint-lightglue'}
+D:\software\Anaconda\anaconda3\envs\dl\lib\site-packages\kornia\feature\lightglue.py:44: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+100%|██████████████████████████████████████████████████████████████████████████████████████████████████| 7118/7118 [08:56<00:00, 13.28it/s]
+[2026/11/13 11:48:23 hloc INFO] Finished exporting matches.
+[2026/11/13 11:48:23 hloc INFO] Starting localization...
+  2%|██                                                                                                    | 7/356 [00:39<32:32,  5.59s/it]

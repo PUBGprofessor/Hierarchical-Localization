@@ -21,23 +21,24 @@ def run(args):
 
     outputs = args.outputs  # where everything will be saved
     sift_sfm = outputs / "sfm_sift"  # from which we extract the reference poses
-    reference_sfm = outputs / "sfm_superpoint+superglue"  # the SfM model we will build
+    reference_sfm = outputs / "sfm_superpoint+lightglue"  # the SfM model we will build
     sfm_pairs = (
         outputs / f"pairs-db-covis{args.num_covis}.txt"
     )  # top-k most covisible in SIFT model
     loc_pairs = (
-        outputs / f"pairs-query-netvlad{args.num_loc}.txt"
+        # outputs / f"pairs-query-netvlad{args.num_loc}.txt"
+        outputs / f"pairs-query-megaloc{args.num_loc}.txt"
     )  # top-k retrieved by NetVLAD
-    results = outputs / f"Aachen_hloc_superpoint+superglue_netvlad{args.num_loc}.txt"
+    results = outputs / f"Aachen_hloc_superpoint+lightglue_megaloc{args.num_loc}.txt"
 
     # list the standard configurations available
     logger.info("Configs for feature extractors:\n%s", pformat(extract_features.confs))
     logger.info("Configs for feature matchers:\n%s", pformat(match_features.confs))
 
     # pick one of the configurations for extraction and matching
-    retrieval_conf = extract_features.confs["netvlad"]
-    feature_conf = extract_features.confs["superpoint_aachen"]
-    matcher_conf = match_features.confs["superglue"]
+    retrieval_conf = extract_features.confs["megaloc"]
+    feature_conf = extract_features.confs["superpoint_my"]
+    matcher_conf = match_features.confs["superpoint+lightglue"]
 
     features = extract_features.main(feature_conf, images, outputs)
 
@@ -76,7 +77,7 @@ def run(args):
         loc_matches,
         results,
         covisibility_clustering=False,
-    )  # not required with SuperPoint+SuperGlue
+    )  # not required with SuperPoint+LightGlue
 
 
 if __name__ == "__main__":
@@ -102,7 +103,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_loc",
         type=int,
-        default=50,
+        # default=50,
+        default=10,
         help="Number of image pairs for loc, default: %(default)s",
     )
     args = parser.parse_args()
