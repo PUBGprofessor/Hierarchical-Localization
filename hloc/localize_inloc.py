@@ -158,6 +158,15 @@ def pose_from_cluster(dataset_dir, q, retrieved, feature_file, match_file, skip=
         all_mkp3d.append(mkp3d[valid])
         all_indices.append(np.full(np.count_nonzero(valid), i))
 
+    # 所有候选都可能低于匹配阈值，或其匹配关键点在 XYZcut 中没有有效深度。
+    # 这时不能 concatenate 空列表，也没有输入可供 PnP；将失败交由调用方记录，
+    # 让其他查询继续定位。
+    if not all_mkpq or not any(len(points) for points in all_mkpq):
+        empty_2d = np.empty((0, 2), dtype=np.float32)
+        empty_3d = np.empty((0, 3), dtype=np.float32)
+        empty_indices = np.empty((0,), dtype=np.int64)
+        return None, empty_2d, empty_2d.copy(), empty_3d, empty_indices, num_matches
+
     all_mkpq = np.concatenate(all_mkpq, 0)
     all_mkpr = np.concatenate(all_mkpr, 0)
     all_mkp3d = np.concatenate(all_mkp3d, 0)
@@ -174,6 +183,8 @@ def pose_from_cluster(dataset_dir, q, retrieved, feature_file, match_file, skip=
     ret = pycolmap.estimate_and_refine_absolute_pose(
         all_mkpq, all_mkp3d, cfg, estimation_options
     )
+    if ret is None:
+        return None, all_mkpq, all_mkpr, all_mkp3d, all_indices, num_matches
     ret["cfg"] = cfg
     return ret, all_mkpq, all_mkpr, all_mkp3d, all_indices, num_matches
 
@@ -221,7 +232,25 @@ def main(dataset_dir, retrieval, features, matches, results, skip_matches=None):
             dataset_dir, q, db, feature_file, match_file, skip_matches
         )
 
-        poses[q] = ret["cam_from_world"]
+        cam_from_world = ret.get("cam_from_world") if ret is not None else None
+        if cam_from_world is not None:
+            poses[q] = cam_from_world
+            status = "localized"
+            failure_reason = None
+        else:
+            status = "failed"
+            failure_reason = (
+                "no_valid_2d3d_correspondences"
+                if len(mkp3d) == 0
+                else "pnp_estimation_failed"
+            )
+            logger.warning(
+                "Localization failed for %s: %s (matches=%d, valid_2d3d=%d)",
+                q,
+                failure_reason,
+                num_matches,
+                len(mkp3d),
+            )
         logs["loc"][q] = {
             "db": db,
             "PnP_ret": ret,
@@ -230,11 +259,18 @@ def main(dataset_dir, retrieval, features, matches, results, skip_matches=None):
             "3d_points": mkp3d,
             "indices_db": indices,
             "num_matches": num_matches,
+            "status": status,
+            "failure_reason": failure_reason,
         }
 
     # 位姿写为文本；日志另存为 pickle，不改变输入的检索、特征或匹配文件。
     logger.info(f"Writing poses to {results}...")
     write_poses(poses, results, prepend_camera_name=False)
+    logger.info(
+        "Localized %d/%d queries; failed queries are listed in the logs",
+        len(poses),
+        len(queries),
+    )
 
     logs_path = f"{results}_logs.pkl"
     logger.info(f"Writing logs to {logs_path}...")

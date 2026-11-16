@@ -110,4 +110,54 @@ Loaded SuperPoint model
 D:\software\Anaconda\anaconda3\envs\dl\lib\site-packages\kornia\feature\lightglue.py:44: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
   @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
  20%|██████████████▋                                                           | 11279/56731 [08:29<28:54, 26.20it/s]
-
+100%|██████████████████████████████████████████████████████████████████████████| 56731/56731 [48:03<00:00, 19.67it/s]
+[2026/11/13 13:57:12 hloc INFO] Finished exporting matches.
+[2026/11/13 13:57:38 hloc INFO] Creating database from the reference model...
+[2026/11/13 13:57:41 hloc INFO] Finished creating the database.
+[2026/11/13 13:57:41 hloc INFO] Created reference_sfm database with 4328 images.
+[2026/11/13 13:57:41 hloc INFO] Importing features into the database...
+100%|██████████████████████████████████████████████████████████████████████████████████████| 4328/4328 [00:09<00:00, 472.25it/s]
+[2026/11/13 13:57:50 hloc INFO] Importing matches into the database...
+100%|████████████████████████████████████████████████████████████████████████████████████| 85515/85515 [11:16<00:00, 126.36it/s]
+[2026/11/13 14:09:07 hloc INFO] Performing geometric verification of the matches...
+100%|███████████████████████████████████████████████████████████████████████████████████████| 4328/4328 [08:50<00:00,  8.16it/s]
+[2026/11/13 14:17:58 hloc INFO] mean/med/min/max valid matches 88.18/98.25/0.00/100.00%.
+[2026/11/13 14:17:58 hloc INFO] Running 3D triangulation...
+[2026/11/13 14:23:47 hloc INFO] Finished the triangulation with statistics:
+Reconstruction:
+        num_rigs = 4328
+        num_cameras = 4328
+        num_frames = 4328
+        num_reg_frames = 4328
+        num_images = 4328
+        num_points3D = 804780
+        num_observations = 5043158
+        mean_track_length = 6.26651
+        mean_observations_per_image = 1165.24
+        mean_reprojection_error = 1.40368
+[2026/11/13 14:23:48 hloc INFO] Extracting local features with configuration:
+{'model': {'name': 'megaloc'},
+ 'output': 'global-feats-megaloc',
+ 'preprocessing': {'resize_max': 1024}}
+[2026/11/13 14:23:48 hloc INFO] Found 5426 images in root D:\Datasets\Aachen-Day-Night\dataset\images_upright.
+Using cache found in C:\Users\yexia/.cache\torch\hub\gmberton_MegaLoc_main
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+ 22%|██████████████████▉                                                                    | 1181/5426 [06:08<22:41,  3.12it/s]
+100%|███████████████████████████████████████████████████████████████████████████████████████| 5426/5426 [27:49<00:00,  3.25it/s]
+[2026/11/13 14:51:47 hloc INFO] Finished exporting features.
+[2026/11/13 14:51:47 hloc INFO] Extracting image pairs from a retrieval database.
+[2026/11/13 14:52:00 hloc INFO] Found 9470 pairs.
+[2026/11/13 14:52:00 hloc INFO] Matching local features with configuration:
+{'model': {'features': 'superpoint', 'name': 'lightglue'},
+ 'output': 'matches-superpoint-lightglue'}
+ 11%|█████████▏                                                                             | 1001/9470 [00:50<05:28, 25.77it/s]
+100%|███████████████████████████████████████████████████████████████████████████████████████| 9470/9470 [08:24<00:00, 18.76it/s]
+[2026/11/13 15:00:25 hloc INFO] Finished exporting matches.
+[2026/11/13 15:00:25 hloc.utils.parsers INFO] Imported 824 images from day_time_queries_with_intrinsics.txt
+[2026/11/13 15:00:25 hloc.utils.parsers INFO] Imported 98 images from night_time_queries_with_intrinsics.txt
+[2026/11/13 15:00:25 hloc.localize_sfm INFO] Reading the 3D model...
+[2026/11/13 15:00:30 hloc.localize_sfm INFO] Starting localization...
+100%|█████████████████████████████████████████████████████████████████████████████████████████| 922/922 [01:36<00:00,  9.51it/s]
+[2026/11/13 15:02:07 hloc.localize_sfm INFO] Localized 922 / 922 images.
+[2026/11/13 15:02:07 hloc.localize_sfm INFO] Writing poses to outputs\aachen\Aachen_hloc_superpoint+lightglue_megaloc10.txt...
+[2026/11/13 15:02:14 hloc.localize_sfm INFO] Done!

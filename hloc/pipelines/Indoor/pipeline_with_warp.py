@@ -579,7 +579,7 @@ if __name__ == "__main__":
         help="query 的估计 COLMAP w2c 位姿文件，不是 query 真值文件",
     )
     parser.add_argument(
-        "--margin", type=int, default=50,
+        "--margin", type=int, default=80,
         help="投影凸包向外扩展的像素数，补偿位姿和稀疏重建误差",
     )
     parser.add_argument(

@@ -222,7 +222,7 @@ def compute_pair_geometry(query_name, map_name, poses, map_model, query_camera, 
     }
 
 
-def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=50):
+def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=80):
     """计算共视掩膜；无估计位姿时返回全图掩膜以跳过该对的共视裁剪。
 
     主定位 pipeline 只需要掩膜，因此保留这个轻量接口；实际几何步骤由
