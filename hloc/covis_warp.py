@@ -21,6 +21,7 @@ Run from any directory, e.g. with the HLoc conda environment:
 import argparse
 from functools import lru_cache
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -33,7 +34,13 @@ ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT))
 from hloc import logger
-from hloc.utils.read_write_model import qvec2rotmat, read_cameras_text, read_images_text, read_points3D_text
+from hloc.utils.read_write_model import (
+    qvec2rotmat,
+    read_cameras_binary,
+    read_cameras_text,
+    read_images_text,
+    read_points3D_text,
+)
 
 
 class PoseNotFoundError(ValueError):
@@ -159,7 +166,9 @@ def load_descriptors(path):
                 for name in sorted(list_h5_names(path))}
 
 
-def compute_pair_geometry(query_name, map_name, poses, map_model, query_camera, margin=50):
+def compute_pair_geometry(
+    query_name, map_name, poses, map_model, query_camera, margin=50, build_masks=True
+):
     """统一计算 query/map 对的共享 3D 点、投影坐标和共视掩膜。
 
     ``query_camera`` 只提供 query 内参；query 外参始终从 ``poses`` 读取。
@@ -167,7 +176,8 @@ def compute_pair_geometry(query_name, map_name, poses, map_model, query_camera, 
     ``point3D_ids``、``xyz``、``query_xy``、``map_xy``、``query_mask``、
     ``map_mask`` 和 map 图像关联点总数。一个共享点生成圆盘，两个点生成
     胶囊形区域，三个及以上构造凸包。pipeline 和离线 warp 均调用本函数，
-    从而确保视锥筛选、投影、凸包和外扩规则一致。
+    从而确保视锥筛选、投影、凸包和外扩规则一致。``build_masks=False``
+    只计算双视锥共享点，供预筛阶段避免提前栅格化掩膜。
     """
     map_model = Path(map_model).resolve()
     images, point_ids, point_xyz, cameras = _read_model_cached(str(map_model))
@@ -203,23 +213,28 @@ def compute_pair_geometry(query_name, map_name, poses, map_model, query_camera, 
         return None
     # 单点/两点的退化凸包由 hull_mask 生成局部圆盘/胶囊区域，不能用全图
     # 掩膜替代，否则共视裁剪失效。掩膜生成失败时明确报错而不是静默放宽。
+    geometry = {
+        "point3D_ids": ids,
+        "xyz": xyz,
+        "query_xy": quv,
+        "map_xy": muv,
+        "points_in_map_image": map_point_count,
+    }
+    if not build_masks:
+        return geometry
     try:
-        qmask = hull_mask(quv, query_camera.width, query_camera.height, margin)
-        mmask = hull_mask(muv, map_camera.width, map_camera.height, margin)
+        geometry["query_mask"] = hull_mask(
+            quv, query_camera.width, query_camera.height, margin
+        )
+        geometry["map_mask"] = hull_mask(
+            muv, map_camera.width, map_camera.height, margin
+        )
     except Exception as exc:
         raise RuntimeError(
             f"Could not build covisibility masks for {query_name} and {map_name} "
             f"from {len(quv)} shared points"
         ) from exc
-    return {
-        "point3D_ids": ids,
-        "xyz": xyz,
-        "query_xy": quv,
-        "map_xy": muv,
-        "query_mask": qmask,
-        "map_mask": mmask,
-        "points_in_map_image": map_point_count,
-    }
+    return geometry
 
 
 def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, margin=80):
@@ -261,7 +276,7 @@ def compute_pair_masks(query_name, map_name, poses, map_model, query_camera, mar
 
 @lru_cache(maxsize=2)
 def _read_model_cached(model_path):
-    """缓存紧凑 map 索引，避免 read_points3D_text 的巨大 Python 对象开销。
+    """缓存紧凑 map 索引，避免加载完整 SfM 图像和轨迹对象。
 
     返回：
       - ``images``：按图像名索引的轻量元数据，只保留位姿、相机 ID 和
@@ -271,6 +286,9 @@ def _read_model_cached(model_path):
     """
     model_path = Path(model_path)
     image_record = namedtuple("CompactImage", "qvec tvec camera_id point3D_ids")
+    if not (model_path / "images.txt").is_file():
+        return _read_binary_model_compact(model_path, image_record)
+
     images = {}
     with (model_path / "images.txt").open("r", encoding="utf-8") as handle:
         while True:
@@ -329,6 +347,81 @@ def _read_model_cached(model_path):
         point_xyz = point_xyz[:point_index]
     order = np.argsort(point_ids)
     return images, point_ids[order], point_xyz[order], read_cameras_text(model_path / "cameras.txt")
+
+
+def _read_binary_model_compact(model_path, image_record):
+    """流式读取 COLMAP binary 模型，只保留共视投影需要的字段。"""
+    image_path = model_path / "images.bin"
+    point_path = model_path / "points3D.bin"
+    camera_path = model_path / "cameras.bin"
+    for path in (camera_path, image_path, point_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Incomplete COLMAP model: {path}")
+
+    observation_dtype = np.dtype([("x", "<f8"), ("y", "<f8"), ("id", "<i8")])
+    images = {}
+    with image_path.open("rb") as handle:
+        raw_count = handle.read(8)
+        if len(raw_count) != 8:
+            raise ValueError(f"Invalid COLMAP binary image file: {image_path}")
+        image_count = struct.unpack("<Q", raw_count)[0]
+        for _ in range(image_count):
+            properties = handle.read(64)
+            if len(properties) != 64:
+                raise ValueError(f"Truncated COLMAP image record in {image_path}")
+            values = struct.unpack("<idddddddi", properties)
+            image_id = values[0]
+            qvec = np.asarray(values[1:5], dtype=np.float64)
+            tvec = np.asarray(values[5:8], dtype=np.float64)
+            camera_id = values[8]
+            name_bytes = bytearray()
+            while True:
+                character = handle.read(1)
+                if not character:
+                    raise ValueError(f"Unterminated image name in {image_path}")
+                if character == b"\x00":
+                    break
+                name_bytes.extend(character)
+            name = name_bytes.decode("utf-8")
+            raw_points = handle.read(8)
+            if len(raw_points) != 8:
+                raise ValueError(f"Missing observation count for {name} in {image_path}")
+            point_count = struct.unpack("<Q", raw_points)[0]
+            observations = handle.read(24 * point_count)
+            if len(observations) != 24 * point_count:
+                raise ValueError(f"Truncated observations for {name} in {image_path}")
+            point3D_ids = np.frombuffer(observations, dtype=observation_dtype)["id"].copy()
+            images[name] = image_record(
+                qvec=qvec,
+                tvec=tvec,
+                camera_id=camera_id,
+                point3D_ids=point3D_ids,
+            )
+
+    with point_path.open("rb") as handle:
+        raw_count = handle.read(8)
+        if len(raw_count) != 8:
+            raise ValueError(f"Invalid COLMAP binary point file: {point_path}")
+        point_count = struct.unpack("<Q", raw_count)[0]
+        point_ids = np.empty(point_count, dtype=np.int64)
+        point_xyz = np.empty((point_count, 3), dtype=np.float32)
+        for index in range(point_count):
+            properties = handle.read(43)
+            if len(properties) != 43:
+                raise ValueError(f"Truncated 3D point record in {point_path}")
+            values = struct.unpack("<QdddBBBd", properties)
+            point_ids[index] = values[0]
+            point_xyz[index] = values[1:4]
+            raw_track_length = handle.read(8)
+            if len(raw_track_length) != 8:
+                raise ValueError(f"Missing track length for point {values[0]} in {point_path}")
+            track_length = struct.unpack("<Q", raw_track_length)[0]
+            track_bytes = 8 * track_length
+            if len(handle.read(track_bytes)) != track_bytes:
+                raise ValueError(f"Truncated track for point {values[0]} in {point_path}")
+
+    order = np.argsort(point_ids)
+    return images, point_ids[order], point_xyz[order], read_cameras_binary(camera_path)
 
 
 def clear_model_cache():
