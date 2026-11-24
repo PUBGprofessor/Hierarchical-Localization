@@ -50,27 +50,39 @@ class PoseNotFoundError(ValueError):
 _WARNED_MISSING_POSES = set()
 
 
+@lru_cache(maxsize=8)
+def _read_pose_table_cached(path, mtime_ns, file_size):
+    exact = {}
+    by_basename = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        row = line.split()
+        if not row or row[0].startswith("#"):
+            continue
+        vals = np.asarray([float(v) for v in row[1:8]])
+        pose = qvec2rotmat(vals[:4]), vals[4:]
+        exact.setdefault(row[0], pose)
+        by_basename.setdefault(Path(row[0]).name, []).append(pose)
+    return exact, by_basename
+
+
 def parse_pose(path, name):
     """从文本位姿文件读取指定图像的 COLMAP w2c 位姿。
 
     文件行格式为 ``name qw qx qy qz tx ty tz``。四元数描述旋转
     ``R``，平移向量为 ``t``，满足 ``X_camera = R X_world + t``。
     """
-    exact = None
-    basename_matches = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        row = line.split()
-        if not row or row[0].startswith("#"):
-            continue
-        if row[0] == name:
-            exact = row
-            break
-        if Path(row[0]).name == Path(name).name:
-            basename_matches.append(row)
-    row = exact if exact is not None else (basename_matches[0] if len(basename_matches) == 1 else None)
-    if row is not None:
-        vals = np.asarray([float(v) for v in row[1:8]])
-        return qvec2rotmat(vals[:4]), vals[4:]
+    path = Path(path)
+    stat = path.stat()
+    exact, by_basename = _read_pose_table_cached(
+        str(path.resolve()), stat.st_mtime_ns, stat.st_size
+    )
+    pose = exact.get(name)
+    if pose is None:
+        basename_matches = by_basename.get(Path(name).name, ())
+        if len(basename_matches) == 1:
+            pose = basename_matches[0]
+    if pose is not None:
+        return pose
     raise PoseNotFoundError(f"Pose for {name!r} not found in {path}")
 
 
@@ -427,6 +439,7 @@ def _read_binary_model_compact(model_path, image_record):
 def clear_model_cache():
     """释放紧凑 SfM 索引；应在 localize_sfm 加载 pycolmap 前调用。"""
     _read_model_cached.cache_clear()
+    _read_pose_table_cached.cache_clear()
 
 
 def process_pair(args, query_name, map_name, output_dir, model_data, query_camera):

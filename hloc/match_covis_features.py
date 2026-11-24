@@ -8,13 +8,14 @@ query/map 对，先按照共视掩膜选出关键点，再把对应的描述子�
 """
 
 from pathlib import Path
+import time
 
 import h5py
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from . import matchers
+from . import logger, matchers
 from .utils.base_model import dynamic_load
 from .utils.parsers import names_to_pair, parse_retrieval
 
@@ -36,23 +37,41 @@ def main(conf, pairs, features_query, features_map, matches, mask_provider, over
     retrieval = parse_retrieval(pairs)
     image_pairs = [(q, r) for q, refs in retrieval.items() for r in refs]
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_started = time.perf_counter()
     Model = dynamic_load(matchers, conf["model"]["name"])
     model = Model(conf["model"]).eval().to(device)
+    model_setup_seconds = time.perf_counter() - model_started
+    mask_seconds = 0.0
+    feature_filter_seconds = 0.0
+    inference_seconds = 0.0
+    write_seconds = 0.0
+    zero_shared_pairs = 0
+    cached_pairs = 0
+    processed_pairs = 0
     with h5py.File(features_query, "r") as fq, h5py.File(features_map, "r") as fm, h5py.File(matches, "a", libver="latest") as out:
         for qname, mname in tqdm(image_pairs, desc="masked feature matching"):
             pair_key = names_to_pair(qname, mname)
-            if not overwrite and pair_key in out:
-                continue
             qgroup, mgroup = fq[qname], fm[mname]
             # mask_provider 的返回值已经由主流程的共视投影算法计算，
             # 这里仅负责将像素掩膜应用到关键点坐标。
-            qmask, mmask = mask_provider(qname, mname)
+            mask_started = time.perf_counter()
+            masks = mask_provider(qname, mname)
+            mask_seconds += time.perf_counter() - mask_started
+            if masks is None:
+                zero_shared_pairs += 1
+                continue
+            qmask, mmask = masks
+            if not overwrite and pair_key in out:
+                cached_pairs += 1
+                continue
+            filter_started = time.perf_counter()
             qxy = np.asarray(qgroup["keypoints"])
             mxy = np.asarray(mgroup["keypoints"])
             # SuperPoint 坐标是 (x, y)，NumPy 图像索引是 [y, x]。
             # 先检查边界，再查掩膜，避免负坐标从数组尾部误取像素。
             qi = np.flatnonzero((qxy[:, 0] >= 0) & (qxy[:, 0] < qmask.shape[1]) & (qxy[:, 1] >= 0) & (qxy[:, 1] < qmask.shape[0]) & qmask[np.clip(qxy[:, 1].astype(int), 0, qmask.shape[0]-1), np.clip(qxy[:, 0].astype(int), 0, qmask.shape[1]-1)])
             mi = np.flatnonzero((mxy[:, 0] >= 0) & (mxy[:, 0] < mmask.shape[1]) & (mxy[:, 1] >= 0) & (mxy[:, 1] < mmask.shape[0]) & mmask[np.clip(mxy[:, 1].astype(int), 0, mmask.shape[0]-1), np.clip(mxy[:, 0].astype(int), 0, mmask.shape[1]-1)])
+            feature_filter_seconds += time.perf_counter() - filter_started
             if not len(qi) or not len(mi):
                 # 没有可送入匹配器的点时，写入全 -1，保持 HLoc 文件格式。
                 expanded = np.full(len(qxy), -1, dtype=np.int16)
@@ -74,7 +93,13 @@ def main(conf, pairs, features_query, features_map, matches, mask_provider, over
                     size = np.asarray(group["image_size"], dtype=np.float32)
                     data[f"image{suffix}"] = torch.empty((1, 1, int(size[1]), int(size[0])), device=device)
                 with torch.no_grad():
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                    inference_started = time.perf_counter()
                     pred = model(data)
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                    inference_seconds += time.perf_counter() - inference_started
                 m0 = pred["matches0"][0].detach().cpu().numpy().astype(np.int64)
                 # m0 的索引只针对裁剪后的 mi 子数组，必须映射回原始
                 # map 特征索引，否则后续 SfM 3D 点查表会错位。
@@ -84,9 +109,26 @@ def main(conf, pairs, features_query, features_map, matches, mask_provider, over
                 scores = np.zeros(len(qxy), dtype=np.float16)
                 if "matching_scores0" in pred:
                     scores[qi] = pred["matching_scores0"][0].detach().cpu().numpy().astype(np.float16)
+            write_started = time.perf_counter()
             if pair_key in out:
                 del out[pair_key]
             grp = out.create_group(pair_key)
             grp.create_dataset("matches0", data=expanded)
             grp.create_dataset("matching_scores0", data=scores)
+            write_seconds += time.perf_counter() - write_started
+            processed_pairs += 1
+    logger.info(
+        "Masked matching timing: %d candidate pairs, %d processed, %d zero-shared, %d cached; "
+        "model setup %.2fs, mask provider %.2fs, keypoint filtering %.2fs, "
+        "LightGlue inference %.2fs, HDF5 write %.2fs",
+        len(image_pairs),
+        processed_pairs,
+        zero_shared_pairs,
+        cached_pairs,
+        model_setup_seconds,
+        mask_seconds,
+        feature_filter_seconds,
+        inference_seconds,
+        write_seconds,
+    )
     return matches

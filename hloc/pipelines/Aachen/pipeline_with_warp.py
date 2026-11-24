@@ -27,8 +27,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT))
 
 from hloc import covis_warp, extract_features, localize_sfm, logger, match_covis_features, match_features
+from hloc.utils.io import list_h5_names
 from hloc.utils.parsers import parse_retrieval
-from hloc.utils.read_write_model import qvec2rotmat
+from hloc.utils.read_write_model import qvec2rotmat, read_cameras_binary, read_images_binary
 
 
 CameraData = namedtuple("CameraData", "model width height params")
@@ -62,7 +63,8 @@ def setup_logging(output_dir):
 
 def read_query_inputs(pattern):
     """读取 Aachen query 名称和内参，不读取 query 外参或真值位姿。"""
-    files = sorted(Path(pattern.parent).glob(pattern.name))
+    pattern = Path(pattern)
+    files = [pattern] if pattern.is_file() else sorted(Path(pattern.parent).glob(pattern.name))
     if not files:
         raise FileNotFoundError(f"No query lists matched: {pattern}")
     cameras = {}
@@ -87,12 +89,40 @@ def read_query_inputs(pattern):
     return cameras
 
 
+def read_names(path):
+    names = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines()
+             if line.strip() and not line.lstrip().startswith("#")]
+    if not names or len(names) != len(set(names)):
+        raise ValueError(f"Image list must be non-empty and unique: {path}")
+    return names
+
+
+def write_query_inputs(model, names, output):
+    """Write query names and intrinsics without using their model poses."""
+    images = read_images_binary(model / "images.bin")
+    cameras = read_cameras_binary(model / "cameras.bin")
+    by_name = {image.name: image for image in images.values()}
+    lines = []
+    for name in names:
+        image = by_name.get(name)
+        if image is None:
+            raise ValueError(f"Query image is missing from the COLMAP model: {name}")
+        camera = cameras[image.camera_id]
+        lines.append(
+            f"{name} {camera.model} {camera.width} {camera.height} "
+            + " ".join(map(str, camera.params))
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output
+
+
 def validate_features(feature_path, image_names):
     """检查复用的局部特征文件确实含有所有 query 和 top-k map 图。"""
     if not feature_path.is_file() or not feature_path.stat().st_size:
         raise FileNotFoundError(f"Expected existing SuperPoint features: {feature_path}")
-    with h5py.File(feature_path, "r") as features:
-        missing = sorted(name for name in image_names if name not in features)
+    available = set(list_h5_names(feature_path))
+    missing = sorted(set(image_names) - available)
     if missing:
         raise ValueError(
             f"SuperPoint feature file is missing {len(missing)} required image groups; "
@@ -255,12 +285,12 @@ def run(args):
     output_dir = args.output_dir.resolve()
     log_path = setup_logging(output_dir)
     query_pattern = dataset / "queries" / "*_time_queries_with_intrinsics.txt"
-    reference_sfm = outputs / "sfm_superpoint+lightglue"
+    reference_sfm = (args.reference_sfm or outputs / "sfm_superpoint+lightglue").resolve()
     sfm_pairs = outputs / f"pairs-db-covis{args.num_covis}.txt"
     feature_conf = extract_features.confs["superpoint_my"]
     matcher_conf = match_features.confs["superpoint+lightglue"]
     feature_path = outputs / f"{feature_conf['output']}.h5"
-    retrieval_pairs = outputs / f"pairs-query-megaloc{args.num_loc}.txt"
+    retrieval_pairs = args.retrieval_pairs or outputs / f"pairs-query-megaloc{args.num_loc}.txt"
     estimated_poses = args.estimated_poses.resolve()
 
     logger.info("Starting Aachen covisibility localization")
@@ -276,8 +306,10 @@ def run(args):
         args.fallback_rotation_threshold,
     )
 
+    split_mode = bool(args.query_list or args.reference_list or args.retrieval_pairs or args.reference_sfm)
+    if split_mode and not (args.query_list and args.reference_list and args.retrieval_pairs):
+        raise ValueError("Split runs require --query-list, --reference-list, and --retrieval-pairs")
     for path in (
-        dataset / "queries",
         reference_sfm,
         sfm_pairs,
         feature_path,
@@ -286,9 +318,33 @@ def run(args):
     ):
         if not path.exists():
             raise FileNotFoundError(path)
+    if split_mode:
+        query_names_list = read_names(args.query_list)
+        reference_names = set(read_names(args.reference_list))
+        if set(query_names_list) & reference_names:
+            raise ValueError("Query and Reference lists overlap")
+        model_names = {image.name for image in read_images_binary(reference_sfm / "images.bin").values()}
+        missing_model_images = (set(query_names_list) | reference_names) - model_names
+        if missing_model_images:
+            raise ValueError(f"Images missing from the shared COLMAP model: {sorted(missing_model_images)[:5]}")
+        query_pattern = write_query_inputs(
+            reference_sfm, query_names_list, output_dir / "queries_with_intrinsics.txt"
+        )
     query_cameras = read_query_inputs(query_pattern)
     query_names = set(query_cameras)
     raw_retrieval = parse_retrieval(retrieval_pairs)
+    if split_mode:
+        unknown_queries = set(raw_retrieval) - query_names
+        unknown_references = {
+            name for candidates in raw_retrieval.values() for name in candidates
+            if name not in reference_names
+        }
+        if unknown_queries or unknown_references:
+            raise ValueError(
+                "Retrieval pairs do not match the supplied split: "
+                f"unknown queries={sorted(unknown_queries)[:3]}, "
+                f"non-reference candidates={sorted(unknown_references)[:3]}"
+            )
     map_names = {name for candidates in raw_retrieval.values() for name in candidates}
     validate_features(feature_path, query_names | map_names)
     logger.info(
@@ -308,7 +364,6 @@ def run(args):
             missing_pose_queries[:5],
         )
 
-    retained = {}
     pair_rows = []
     row_by_pair = {}
     skipped_queries = 0
@@ -318,8 +373,6 @@ def run(args):
         if query_name not in query_cameras:
             skipped_queries += 1
             continue
-        query_camera = query_cameras[query_name]
-        good = []
         for rank, map_name in enumerate(candidates, 1):
             total_pairs += 1
             row = {
@@ -333,32 +386,68 @@ def run(args):
                 "map_mask_pixels": "",
                 "map_mask_ratio": "",
             }
-            try:
-                geometry = covis_warp.compute_pair_geometry(
-                    query_name,
-                    map_name,
-                    estimated_poses,
-                    reference_sfm,
-                    query_camera,
-                    margin=args.margin,
-                    build_masks=False,
-                )
-            except covis_warp.PoseNotFoundError:
-                # 缺少估计位姿时不能判定共视关系；保留候选并在匹配阶段用全图掩膜。
-                row["status"] = "missing_pose_full_image"
-                geometry = "missing_pose"
-            if geometry is None:
-                row["status"] = "zero_shared_points"
-                removed_pairs += 1
-            else:
-                if isinstance(geometry, dict):
-                    row["shared_points"] = int(len(geometry["point3D_ids"]))
-                good.append(map_name)
             pair_rows.append(row)
             row_by_pair[(query_name, map_name)] = row
-        if good:
-            retained[query_name] = good
 
+    loc_matches = output_dir / f"matches-covis-megaloc{args.num_loc}.h5"
+
+    def pair_masks(query_name, map_name):
+        row = row_by_pair[(query_name, map_name)]
+        try:
+            geometry = covis_warp.compute_pair_geometry(
+                query_name,
+                map_name,
+                estimated_poses,
+                reference_sfm,
+                query_cameras[query_name],
+                margin=args.margin,
+                build_masks=True,
+            )
+        except covis_warp.PoseNotFoundError:
+            # 缺少估计位姿时无法安全裁剪；按方法定义保留候选并使用全图掩膜。
+            row["status"] = "missing_pose_full_image"
+            masks = covis_warp.compute_pair_masks(
+                query_name,
+                map_name,
+                estimated_poses,
+                reference_sfm,
+                query_cameras[query_name],
+                margin=args.margin,
+            )
+            if masks is None:
+                raise RuntimeError(f"Could not build fallback masks for {query_name!r}, {map_name!r}")
+            query_mask, map_mask = masks
+        else:
+            if geometry is None:
+                row["status"] = "zero_shared_points"
+                return None
+            row["shared_points"] = int(len(geometry["point3D_ids"]))
+            query_mask, map_mask = geometry["query_mask"], geometry["map_mask"]
+            masks = query_mask, map_mask
+
+        row["query_mask_pixels"] = int(query_mask.sum())
+        row["query_mask_ratio"] = float(query_mask.mean())
+        row["map_mask_pixels"] = int(map_mask.sum())
+        row["map_mask_ratio"] = float(map_mask.mean())
+        return masks
+
+    if total_pairs:
+        logger.info("Running masked SuperPoint + LightGlue matching: %s", loc_matches)
+        match_covis_features.main(
+            matcher_conf,
+            retrieval_pairs,
+            feature_path,
+            feature_path,
+            loc_matches,
+            mask_provider=pair_masks,
+            overwrite=args.overwrite_matches,
+        )
+    retained = {}
+    for row in pair_rows:
+        if row["status"] != "zero_shared_points":
+            retained.setdefault(row["query"], []).append(row["map"])
+        else:
+            removed_pairs += 1
     filtered_pairs = output_dir / f"pairs-query-megaloc{args.num_loc}-covis.txt"
     filtered_pairs.write_text(
         "".join(
@@ -370,66 +459,38 @@ def run(args):
     )
     kept_pairs = sum(map(len, retained.values()))
     logger.info(
-        "Covisibility prefilter: kept %d/%d pairs, removed %d zero-shared-point pairs; "
+        "Covisibility/matching pass: kept %d/%d pairs, removed %d zero-shared-point pairs; "
         "skipped %d retrieval query keys outside the Aachen query lists",
         kept_pairs,
         total_pairs,
         removed_pairs,
         skipped_queries,
     )
-    if not kept_pairs:
-        write_pair_report(pair_rows, output_dir)
-        raise ValueError("No retrieval pairs have shared 3D points; localization cannot continue")
-
-    loc_matches = output_dir / f"matches-covis-megaloc{args.num_loc}.h5"
-
-    def pair_masks(query_name, map_name):
-        masks = covis_warp.compute_pair_masks(
-            query_name,
-            map_name,
-            estimated_poses,
-            reference_sfm,
-            query_cameras[query_name],
-            margin=args.margin,
-        )
-        if masks is None:
-            raise RuntimeError(
-                f"Pair {query_name!r}, {map_name!r} passed the shared-point filter but has no mask"
-            )
-        query_mask, map_mask = masks
-        row = row_by_pair[(query_name, map_name)]
-        row["query_mask_pixels"] = int(query_mask.sum())
-        row["query_mask_ratio"] = float(query_mask.mean())
-        row["map_mask_pixels"] = int(map_mask.sum())
-        row["map_mask_ratio"] = float(map_mask.mean())
-        return masks
-
-    logger.info("Running masked SuperPoint + LightGlue matching: %s", loc_matches)
-    match_covis_features.main(
-        matcher_conf,
-        filtered_pairs,
-        feature_path,
-        feature_path,
-        loc_matches,
-        mask_provider=pair_masks,
-        overwrite=args.overwrite_matches,
-    )
     pair_summary = write_pair_report(pair_rows, output_dir)
+    if not kept_pairs:
+        logger.warning(
+            "No retrieval pairs have shared 3D points; continuing with per-query Reloc3r fallback"
+        )
     logger.info("Saved pair-level covisibility report: %s", output_dir / "covisibility_pairs.csv")
 
     # 释放文本 SfM 的 NumPy 索引，避免它与 pycolmap 定位模型同时占用内存。
     covis_warp.clear_model_cache()
     results = output_dir / "query_poses.txt"
-    logger.info("Running HLoc PnP localization: %s", results)
-    localize_sfm.main(
-        reference_sfm,
-        query_pattern,
-        filtered_pairs,
-        feature_path,
-        loc_matches,
-        results,
-        covisibility_clustering=False,
-    )
+    if kept_pairs:
+        logger.info("Running HLoc PnP localization: %s", results)
+        localize_sfm.main(
+            reference_sfm,
+            query_pattern,
+            filtered_pairs,
+            feature_path,
+            loc_matches,
+            results,
+            covisibility_clustering=False,
+        )
+    else:
+        results.write_text("", encoding="utf-8")
+        with Path(f"{results}_logs.pkl").open("wb") as handle:
+            pickle.dump({"loc": {}}, handle)
     fallback_names = apply_estimated_pose_fallback(
         results,
         estimated_poses,
@@ -460,6 +521,10 @@ def run(args):
     (output_dir / "pipeline_summary.json").write_text(
         json.dumps(run_summary, indent=2) + "\n", encoding="utf-8"
     )
+    (output_dir / "stage_complete.json").write_text(
+        json.dumps({"stage": "ours", "query_count": len(query_names)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     logger.info("Finished Aachen covisibility localization: %s", run_summary)
     logger.info("Final poses: %s", results)
 
@@ -486,6 +551,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-covis", type=int, default=20)
     parser.add_argument("--num-loc", type=int, default=10)
+    parser.add_argument("--query-list", type=Path, help="Split query names, one image per line")
+    parser.add_argument("--reference-list", type=Path, help="Split Reference names, one image per line")
+    parser.add_argument("--retrieval-pairs", type=Path, help="Shared retrieval pairs generated by the Baseline run")
+    parser.add_argument("--reference-sfm", type=Path, help="Shared full COLMAP model")
     parser.add_argument(
         "--estimated-poses",
         type=Path,

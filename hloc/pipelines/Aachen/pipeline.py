@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 from pprint import pformat
 
@@ -12,6 +13,37 @@ from ... import (
     pairs_from_retrieval,
     triangulation,
 )
+from ...utils.read_write_model import read_cameras_binary, read_images_binary
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def read_names(path):
+    names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+             if line.strip() and not line.lstrip().startswith("#")]
+    if not names or len(names) != len(set(names)):
+        raise ValueError(f"Image list must be non-empty and unique: {path}")
+    return names
+
+
+def write_query_list(model, names, output):
+    """Write only query intrinsics from the shared COLMAP model."""
+    images = read_images_binary(model / "images.bin")
+    cameras = read_cameras_binary(model / "cameras.bin")
+    by_name = {image.name: image for image in images.values()}
+    lines = []
+    for name in names:
+        image = by_name.get(name)
+        if image is None:
+            raise ValueError(f"Query image is missing from the COLMAP model: {name}")
+        camera = cameras[image.camera_id]
+        lines.append(
+            f"{name} {camera.model} {camera.width} {camera.height} "
+            + " ".join(map(str, camera.params))
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output
 
 
 def run(args):
@@ -21,7 +53,7 @@ def run(args):
 
     outputs = args.outputs  # where everything will be saved
     sift_sfm = outputs / "sfm_sift"  # from which we extract the reference poses
-    reference_sfm = outputs / "sfm_superpoint+lightglue"  # the SfM model we will build
+    reference_sfm = args.sfm_model or outputs / "sfm_superpoint+lightglue"
     sfm_pairs = (
         outputs / f"pairs-db-covis{args.num_covis}.txt"
     )  # top-k most covisible in SIFT model
@@ -29,7 +61,12 @@ def run(args):
         # outputs / f"pairs-query-netvlad{args.num_loc}.txt"
         outputs / f"pairs-query-megaloc{args.num_loc}.txt"
     )  # top-k retrieved by NetVLAD
-    results = outputs / f"Aachen_hloc_superpoint+lightglue_megaloc{args.num_loc}.txt"
+    experiment_mode = bool(args.query_list or args.reference_list or args.experiment_dir)
+    if experiment_mode and not (args.query_list and args.reference_list and args.experiment_dir):
+        raise ValueError("Split runs require --query-list, --reference-list, and --experiment-dir")
+    result_dir = args.experiment_dir if experiment_mode else outputs
+    result_dir.mkdir(parents=True, exist_ok=True)
+    results = result_dir / ("query_poses.txt" if experiment_mode else f"Aachen_hloc_superpoint+lightglue_megaloc{args.num_loc}.txt")
 
     # list the standard configurations available
     logger.info("Configs for feature extractors:\n%s", pformat(extract_features.confs))
@@ -39,6 +76,56 @@ def run(args):
     retrieval_conf = extract_features.confs["megaloc"]
     feature_conf = extract_features.confs["superpoint_my"]
     matcher_conf = match_features.confs["superpoint+lightglue"]
+
+    if experiment_mode:
+        query_names = read_names(args.query_list)
+        reference_names = read_names(args.reference_list)
+        if set(query_names) & set(reference_names):
+            raise ValueError("Query and Reference lists overlap")
+        model_images = read_images_binary(reference_sfm / "images.bin")
+        registered = {image.name for image in model_images.values()}
+        missing = (set(query_names) | set(reference_names)) - registered
+        if missing:
+            raise ValueError(f"Images missing from the shared COLMAP model: {sorted(missing)[:5]}")
+        selected_images = sorted(set(query_names) | set(reference_names))
+        features = extract_features.main(feature_conf, images, outputs, image_list=selected_images)
+        global_descriptors = extract_features.main(retrieval_conf, images, outputs, image_list=selected_images)
+        query_inputs = write_query_list(reference_sfm, query_names, result_dir / "queries_with_intrinsics.txt")
+        loc_pairs = result_dir / f"pairs-query-megaloc{args.num_loc}.txt"
+        pairs_from_retrieval.main(
+            global_descriptors,
+            loc_pairs,
+            min(args.num_loc, len(reference_names)),
+            query_list=query_names,
+            db_list=reference_names,
+        )
+        loc_matches = match_features.main(
+            matcher_conf,
+            loc_pairs,
+            features,
+            features_ref=features,
+            matches=(args.match_cache_dir or
+                     ROOT.parent / "HLoc_Reloc3r_Experiments" / "cache" / "Aachen")
+            / f"matches-query-megaloc{args.num_loc}.h5",
+        )
+        localize_sfm.main(
+            reference_sfm,
+            query_inputs,
+            loc_pairs,
+            features,
+            loc_matches,
+            results,
+            covisibility_clustering=False,
+        )
+        (result_dir / "stage_complete.json").write_text(
+            json.dumps({"stage": "baseline", "query_count": len(query_names)}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        logger.info(
+            "Completed Aachen split baseline: %d queries, %d references, shared full map %s",
+            len(query_names), len(reference_names), reference_sfm,
+        )
+        return
 
     features = extract_features.main(feature_conf, images, outputs)
 
@@ -107,5 +194,11 @@ if __name__ == "__main__":
         default=10,
         help="Number of image pairs for loc, default: %(default)s",
     )
+    parser.add_argument("--query-list", type=Path, help="Split query names, one image per line")
+    parser.add_argument("--reference-list", type=Path, help="Split Reference names, one image per line")
+    parser.add_argument("--experiment-dir", type=Path, help="Isolated split-run output directory")
+    parser.add_argument("--sfm-model", type=Path, help="Shared full COLMAP model for split runs")
+    parser.add_argument("--match-cache-dir", type=Path,
+                        help="Shared unmasked query/reference match cache for split runs")
     args = parser.parse_args()
     run(args)
